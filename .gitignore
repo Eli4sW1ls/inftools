@@ -1,4 +1,5 @@
 *__pycache__/
 *.pyc
 *.pyo
-*.pyd
+*.pyd# Byte-compiled / optimized / DLL files
+tags
