@@ -43,6 +43,8 @@ def run_analysis(inp_dic):
     z_min = inp_dic["zmin"]
     z_max = inp_dic["zmax"]
     timeunit = inp_dic["timestep"] * inp_dic["subcycle"] * 1e-15 # fs to sec
+    # interpret lm1: None or False means no correction
+    use_lm1 = lm1 is not None and lm1 is not False
 
     # the Cxy values of [0+] are stored in the i0plus-th
     # column (first coulumn is counted as column nr 0)
@@ -718,8 +720,8 @@ def run_analysis(inp_dic):
         filename,
     )
 
-    if lm1 == False:
-        # running average of flux
+    if not use_lm1:
+        # running average of flux (conventional, no lm1 correction)
         filename = os.path.join(folder, "runav_flux.txt")
         with open(filename, "w") as file:
             file.write("#counter    flux-conv flux-wham\n")
@@ -881,7 +883,7 @@ def run_analysis(inp_dic):
     WFtot = [a + b for a, b in zip(WHAMfactorsMIN, WHAMfactors)]
     trajlabels = [int(x[0]) for x in matrix]
     xi_best_estimate = None
-    if lm1 != False:
+    if use_lm1:
         print(f"CHECK! Timeunit (timestep*subcycles) is {timeunit} s.")
         runav_xi_lm1 = []
         DeltaZ_phasepoints_sum_list = []    
@@ -960,6 +962,100 @@ def run_analysis(inp_dic):
                 file.write(f"\t{y2}")
                 file.write(f"\t{y3}")
                 file.write("\n")
+
+        # The xi-corrected flux and rate should replace the
+        # conventional definitions so that downstream output and
+        # error analysis use the correct values.  Overwrite the
+        # primary arrays here and re‑compute any affected statistics.
+        # runav_flux_lm1 already contains the time‑unit‑scaled flux.
+        runav_FLUX_CONV = runav_flux_lm1
+        runav_FLUXWHAM = [
+            x / (((y1 - 2) + x * (y2 - 2)) * timeunit)
+            for x, y1, y2 in zip(runav_xi_lm1, runav_L0min, runav_L0plusWHAM)
+        ]
+        runav_FLUX = zip(runav_FLUX_CONV, runav_FLUXWHAM)
+        runav_RATE_PM = [f * p for f, p in zip(runav_FLUX_CONV, run_av_PtotPM)]
+        runav_RATE_WHAM = [f * p for f, p in zip(runav_FLUX_CONV, run_av_PtotWHAM)]
+        runav_RATE_WHAMWHAM = [f * p for f, p in zip(runav_FLUXWHAM, run_av_PtotWHAM)]
+        runav_RATE = zip(runav_RATE_PM, runav_RATE_WHAM, runav_RATE_WHAMWHAM)
+
+        # recompute flux/rate errors with the corrected arrays
+        errFLUX_CONV, statineffFLUX_CONV, blockerrs_FLUX_CONV = rec_block_errors(
+            runav_FLUX_CONV, minblocks
+        )
+        errFLUX_WHAM, statineffFLUX_WHAM, blockerrs_FLUX_WHAM = rec_block_errors(
+            runav_FLUXWHAM, minblocks
+        )
+        errFLUX = [errFLUX_CONV, errFLUX_WHAM]
+        statineffFLUX = [statineffFLUX_CONV, statineffFLUX_WHAM]
+        blockerrs_FLUX = zip(blockerrs_FLUX_CONV, blockerrs_FLUX_WHAM)
+
+        errRATEpm, statineffRATEpm, blockerrs_RATEpm = rec_block_errors(
+            runav_RATE_PM, minblocks
+        )
+        errRATEWHAM, statineffRATEWHAM, blockerrs_RATEWHAM = rec_block_errors(
+            runav_RATE_WHAM, minblocks
+        )
+        errRATEWHAMWHAM, statineffRATEWHAMWHAM, blockerrs_RATEWHAMWHAM = rec_block_errors(
+            runav_RATE_WHAMWHAM, minblocks
+        )
+        errRATE = [errRATEpm, errRATEWHAM, errRATEWHAMWHAM]
+        statineffRATE = [statineffRATEpm, statineffRATEWHAM, statineffRATEWHAMWHAM]
+        blockerrs_RATE = zip(
+            blockerrs_RATEpm, blockerrs_RATEWHAM, blockerrs_RATEWHAMWHAM
+        )
+
+        # re‑write the conventional flux/rate files using corrected values
+        filename = os.path.join(folder, "runav_flux_lm1.txt")
+        with open(filename, "w") as file:
+            file.write("#counter    flux-conv flux-wham\n")
+            for counter, (y1, y2) in enumerate(runav_FLUX):
+                file.write(f"{counter}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write("\n")
+        print("Running averages of flux (lm1-corrected) written at: ", filename)
+
+        filename = os.path.join(folder, "runav_rate_lm1.txt")
+        with open(filename, "w") as file:
+            file.write("#counter  rate-pm rate-wham rate-whamwham \n")
+            for counter, (y1, y2, y3) in enumerate(runav_RATE):
+                file.write(f"{counter}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write(f"\t{y3}")
+                file.write("\n")
+        print("Running averages of rate (lm1-corrected) written at: ", filename)
+
+        # also overwrite the error files with the corrected statistics
+        filename = os.path.join(folder, "errFLUX_lm1.txt")
+        with open(filename, "w") as file:
+            file.write("#averaged rel-error CONV, WHAM: " + str(errFLUX) + "\n")
+            file.write("#statistical inefficiency CONV, WHAM: " + str(statineffFLUX) + "\n")
+            file.write("#block-length rel-error \n")
+            for counter, (y1, y2) in enumerate(blockerrs_FLUX):
+                file.write(f"{counter+1}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write("\n")
+        print(f"Error Analysis for flux (lm1-corrected) written to {filename}")
+
+        filename = os.path.join(folder, "errRATE_lm1.txt")
+        with open(filename, "w") as file:
+            file.write("#averaged rel-error PM, WHAM, WHAMWHAM: " + str(errRATE) + "\n")
+            file.write("#statistical inefficiency PM, WHAM, WHAMWHAM: " + str(statineffRATE) + "\n")
+            file.write(
+                "#Please note that here reported statistical "
+                + "inefficiencies might not be easily interpretable\n"
+            )
+            file.write("#block-length rel-error \n")
+            for counter, (y1, y2, y3) in enumerate(blockerrs_RATE):
+                file.write(f"{counter+1}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write(f"\t{y3}")
+                file.write("\n")
+        print(f"Error Analysis for rate (lm1-corrected) written to {filename}")
         print(f"Error Analysis for xi flux rate with lm1 corrected written to {filename}")
 
     # Calculate Landau Free energy?
