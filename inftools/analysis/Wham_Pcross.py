@@ -5,10 +5,33 @@ import numpy as np
 from inftools.analysis.rec_error import rec_block_errors
 from inftools.analysis.toolsWHAM import PcrossWHAM2, get_WHAMfactors
 from inftools.analysis.Free_energy import calculate_free_energy
+from inftools.analysis.pcross_plot import plot_combined_pcross
 
+def extract(trajfile, lm1, lA, xcol, z_min=None, z_max=None):
+    traj = np.loadtxt(trajfile)
+    first = traj[0, xcol]
+    second = traj[1, xcol]
+    last = traj[-1, xcol]
+    if first >= lA and last >= lA and second < first:
+        type = "RMR"
+    elif first >= lA and last <= lm1:
+        type = "RML"
+    elif first <= lm1 and last <= lm1:
+        type = "LML"
+    elif first <= lm1 and last >= lA:
+        type = "LMR"
+    else:
+        type = "0+"
+
+    if type != "0+" and z_min is not None and z_max is not None:
+        tau_ref = np.sum(((traj[:,xcol]) > z_min) & ((traj[:,xcol]) < z_max))
+    else:
+        tau_ref = 0
+    return type, tau_ref
 
 def run_analysis(inp_dic):
     CalcFE = inp_dic["fener"]
+    sym = inp_dic["sym"]
     ifile = inp_dic["data"]
     lambda_interfaces = [float(i) for i in inp_dic["intfs"]]
     lamres = float(inp_dic["lamres"])
@@ -17,6 +40,9 @@ def run_analysis(inp_dic):
     folder = inp_dic["folder"]
     histo_stuff = inp_dic["histo_stuff"]
     lm1 = inp_dic["lm1"]
+    z_min = inp_dic["zmin"]
+    z_max = inp_dic["zmax"]
+    timeunit = inp_dic["timestep"] * inp_dic["subcycle"] * 1e-15 # fs to sec
 
     # the Cxy values of [0+] are stored in the i0plus-th
     # column (first coulumn is counted as column nr 0)
@@ -86,15 +112,17 @@ def run_analysis(inp_dic):
     # sum of Pxy after weighting with inverse HA-weights
     sumPxy_afterw = [0.0] * nintf
     for x in matrix:
+        # print(x)
         for y in range(nintf):
             # index of value that requires unweighting
             y1 = i0min + y
             # index of HA-weight
-            y2 = y1 + nintf
+            y2 = y1 + nintf            
             if x[y2] > 0:  # non-zero weight
                 sumPxy[y] += x[y1]  # sum before unweighting
                 x[y1] /= x[y2]
                 sumPxy_afterw[y] += x[y1]  # sum after unweighting
+                # print(y, y1, y2, x[y1], x[y2], sumPxy_afterw[y])
             elif x[y1] > 0:
                 print("Division by zero for path x=", x)
                 exit()
@@ -249,6 +277,7 @@ def run_analysis(inp_dic):
     # Normalize the p_loc arrays such that each local
     # crossing probability of ensemble [i+] starts with 1 at lambda_i
     Pi0_wham, Q = WHAM_PQ(nplus_ens, lambda_interfaces, lamres, eta, v_alpha)
+    print(f"="*110)
     print(
         "Check. The following two numbers should be the nearly same:",
         Pi0_wham[-1],
@@ -689,28 +718,29 @@ def run_analysis(inp_dic):
         filename,
     )
 
-    # running average of flux
-    filename = os.path.join(folder, "runav_flux.txt")
-    with open(filename, "w") as file:
-        file.write("#counter    flux-conv flux-wham\n")
-        for counter, (y1, y2) in enumerate(runav_FLUX):
-            file.write(f"{counter}   ")
-            file.write(f"\t{y1}")
-            file.write(f"\t{y2}")
-            file.write("\n")
-    print("Running averages of flux written at: ", filename)
+    if lm1 == False:
+        # running average of flux
+        filename = os.path.join(folder, "runav_flux.txt")
+        with open(filename, "w") as file:
+            file.write("#counter    flux-conv flux-wham\n")
+            for counter, (y1, y2) in enumerate(runav_FLUX):
+                file.write(f"{counter}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write("\n")
+        print("Running averages of flux written at: ", filename)
 
-    # running average of rate
-    filename = os.path.join(folder, "runav_rate.txt")
-    with open(filename, "w") as file:
-        file.write("#counter  rate-pm rate-wham rate-whamwham \n")
-        for counter, (y1, y2, y3) in enumerate(runav_RATE):
-            file.write(f"{counter}   ")
-            file.write(f"\t{y1}")
-            file.write(f"\t{y2}")
-            file.write(f"\t{y3}")
-            file.write("\n")
-    print("Running averages of rate written at: ", filename)
+        # running average of rate
+        filename = os.path.join(folder, "runav_rate.txt")
+        with open(filename, "w") as file:
+            file.write("#counter  rate-pm rate-wham rate-whamwham \n")
+            for counter, (y1, y2, y3) in enumerate(runav_RATE):
+                file.write(f"{counter}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write(f"\t{y3}")
+                file.write("\n")
+        print("Running averages of rate written at: ", filename)
 
     # average path length per ensembl
     filename = os.path.join(folder, "pathlengths.txt")
@@ -798,58 +828,142 @@ def run_analysis(inp_dic):
             file.write("\n")
     print(f"Error Analysis for L0 path length written to {filename}")
 
-    filename = os.path.join(folder, "errFLUX.txt")
-    with open(filename, "w") as file:
-        file.write("#averaged rel-error CONV, WHAM: " + str(errFLUX) + "\n")
-        file.write(
-            "#statistical inefficiency CONV, WHAM: "
-            + str(statineffFLUX)
-            + "\n"
-        )
-        file.write(
-            "#Please note that here reported statistical "
-            + "inefficiencies might not be easily interpretable\n"
-        )
-        file.write("#block-length rel-error \n")
-        for counter, (y1, y2) in enumerate(blockerrs_FLUX):
-            file.write(f"{counter+1}   ")
-            file.write(f"\t{y1}")
-            file.write(f"\t{y2}")
-            file.write("\n")
-    print(f"Error Analysis for flux written to {filename}")
+    if lm1 == False:
+        filename = os.path.join(folder, "errFLUX.txt")
+        with open(filename, "w") as file:
+            file.write("#averaged rel-error CONV, WHAM: " + str(errFLUX) + "\n")
+            file.write(
+                "#statistical inefficiency CONV, WHAM: "
+                + str(statineffFLUX)
+                + "\n"
+            )
+            file.write(
+                "#Please note that here reported statistical "
+                + "inefficiencies might not be easily interpretable\n"
+            )
+            file.write("#block-length rel-error \n")
+            for counter, (y1, y2) in enumerate(blockerrs_FLUX):
+                file.write(f"{counter+1}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write("\n")
+        print(f"Error Analysis for flux written to {filename}")
 
-    filename = os.path.join(folder, "errRATE.txt")
-    with open(filename, "w") as file:
-        file.write(
-            "#averaged rel-error PM, WHAM, WHAMWHAM: " + str(errRATE) + "\n"
-        )
-        file.write(
-            "#statistical inefficiency PM, WHAM, WHAM: "
-            + str(statineffRATE)
-            + "\n"
-        )
-        file.write(
-            "#Please note that here reported statistical "
-            + "inefficiencies might not be easily interpretable\n"
-        )
-        file.write("#block-length rel-error \n")
-        for counter, (y1, y2, y3) in enumerate(blockerrs_RATE):
-            file.write(f"{counter+1}   ")
-            file.write(f"\t{y1}")
-            file.write(f"\t{y2}")
-            file.write(f"\t{y3}")
-            file.write("\n")
-    print(f"Error Analysis for rate written to {filename}")
+        filename = os.path.join(folder, "errRATE.txt")
+        with open(filename, "w") as file:
+            file.write(
+                "#averaged rel-error PM, WHAM, WHAMWHAM: " + str(errRATE) + "\n"
+            )
+            file.write(
+                "#statistical inefficiency PM, WHAM, WHAM: "
+                + str(statineffRATE)
+                + "\n"
+            )
+            file.write(
+                "#Please note that here reported statistical "
+                + "inefficiencies might not be easily interpretable\n"
+            )
+            file.write("#block-length rel-error \n")
+            for counter, (y1, y2, y3) in enumerate(blockerrs_RATE):
+                file.write(f"{counter+1}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write(f"\t{y3}")
+                file.write("\n")
+        print(f"Error Analysis for rate written to {filename}")
+
+    plot_combined_pcross(folder)
+    
+    WHAMfactorsMIN = [x[i0min] for x in matrix]
+    sumWM = sum(WHAMfactorsMIN)
+    WHAMfactorsMIN = [val / sumWM for val in WHAMfactorsMIN]
+    # "Semi"-WHAM factors for the [0^-] ensemble
+    WFtot = [a + b for a, b in zip(WHAMfactorsMIN, WHAMfactors)]
+    trajlabels = [int(x[0]) for x in matrix]
+    xi_best_estimate = None
+    if lm1 != False:
+        print(f"CHECK! Timeunit (timestep*subcycles) is {timeunit} s.")
+        runav_xi_lm1 = []
+        DeltaZ_phasepoints_sum_list = []    
+        count_0_min_paths_sum_list = []        
+        runav_tau_ref = []
+        count_0_min_paths_sum = 0
+        DeltaZ_phasepoints_sum = 0
+        type_count = {"RMR": 0,"RML": 0,"LML": 0,"LMR": 0,"0+": 0}
+        for label, factor in zip(trajlabels, WFtot):
+            trajfile = inp_dic["trajdir"] + "/" + str(label) + "/order.txt"
+            type, DeltaZ_phasepoints = extract(trajfile, lm1, lambda_interfaces[0], histo_stuff["xcol"], z_min, z_max)
+            # for tau_ref calculation
+            DeltaZ_phasepoints_sum += DeltaZ_phasepoints
+            DeltaZ_phasepoints_sum_list.append(DeltaZ_phasepoints_sum)
+            if type != "0+":
+                count_0_min_paths_sum += 1
+            count_0_min_paths_sum_list.append(count_0_min_paths_sum)
+            runav_tau_ref.append(DeltaZ_phasepoints_sum / count_0_min_paths_sum if count_0_min_paths_sum != 0 else 0)
+            # for xi calculation
+            type_count[type] += factor
+            R_END = type_count["LMR"] + type_count["RMR"]
+            L_END = type_count["LML"] + type_count["RML"]
+            runav_xi_lm1.append(float('nan') if (R_END + L_END) == 0 else R_END / (R_END + L_END))
+        xi_best_estimate = runav_xi_lm1[-1]
+        runav_flux_lm1 = [x / (((y1 - 2) + x * (y2 - 2)) * timeunit) for x, y1, y2 in zip(runav_xi_lm1, runav_L0min, runav_L0plus)]
+        runav_rate_lm1 = [y1 * y2 for y1, y2 in zip(runav_flux_lm1, run_av_PtotWHAM)]
+        filename = os.path.join(folder, "runav_xi_flux_rate_lm1.txt")
+        with open(filename, "w") as file:
+            file.write("#counter, xi, flux (1/s), rate (1/s)\n")
+            for counter, (y1, y2, y3) in enumerate(zip(runav_xi_lm1, runav_flux_lm1, runav_rate_lm1)):
+                file.write(f"{counter}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write(f"\t{y3}")
+                file.write("\n")
+        print("Running averages of xi flux rate permeability with lm1_corrected written to: ", filename)
+        
+        if z_min != None or z_max != None:
+            runav_tau_ref = [x * timeunit for x in runav_tau_ref] # convert phasepoint to fs
+            DeltaZ = (z_max - z_min) * 1e-8 # Å to cm so that the permeability is in units of cm/s 
+            runav_perm_lm1 = [(x1 * DeltaZ * x2 / y1) if y1 != 0 else float('nan') for x1, x2, y1 in zip(runav_xi_lm1, run_av_PtotWHAM, runav_tau_ref)]
+            filename = os.path.join(folder, "runav_permeability_lm1.txt")
+            with open(filename, "w") as file:
+                file.write("#counter, xi, 0_minus_path_count, phasepoints_in_DeltaZ, tau_ref (1/s), permeability (cm/s)\n")
+                for counter, (y1, y2, y3, y4, y5) in enumerate(zip(runav_xi_lm1, count_0_min_paths_sum_list, DeltaZ_phasepoints_sum_list, runav_tau_ref, runav_perm_lm1)):
+                    file.write(f"{counter}   ")
+                    file.write(f"\t{y1}")
+                    file.write(f"\t{y2}")
+                    file.write(f"\t{y3}")
+                    file.write(f"\t{y4}")
+                    file.write(f"\t{y5}")
+                    file.write("\n")
+            print("Running average of permeability with lm1 corrected version written to: ", filename)
+            
+            err_perm_lm1, _, blockerrs_perm_lm1 = rec_block_errors(runav_perm_lm1, minblocks)
+            filename = os.path.join(folder, "err_permeability_lm1.txt")
+            with open(filename, "w") as file:
+                file.write("#averaged rel-error permeability: " + str([err_perm_lm1]) + "\n")
+                file.write("#block-length, rel-error permeability\n")
+                for counter, y1 in enumerate(blockerrs_perm_lm1):
+                    file.write(f"{counter+1}   ")
+                    file.write(f"\t{y1}")
+                    file.write("\n")
+            print(f"Error Analysis for permeability with lm1 corrected written to {filename}")
+
+        err_xi, _, blockerrs_xi = rec_block_errors(runav_xi_lm1, minblocks)
+        err_flux_lm1, _, blockerrs_flux_lm1 = rec_block_errors(runav_flux_lm1, minblocks)
+        err_rate_lm1, _, blockerrs_rate_lm1 = rec_block_errors(runav_rate_lm1, minblocks)
+        filename = os.path.join(folder, "err_xi_flux_rate_lm1.txt")
+        with open(filename, "w") as file:
+            file.write("#averaged rel-error: xi, flux, rate: " + str([err_xi, err_flux_lm1, err_rate_lm1]) + "\n")
+            file.write("#block-length, rel-error: xi, flux, rate\n")
+            for counter, (y1, y2, y3) in enumerate(zip(blockerrs_xi, blockerrs_flux_lm1, blockerrs_rate_lm1)):
+                file.write(f"{counter+1}   ")
+                file.write(f"\t{y1}")
+                file.write(f"\t{y2}")
+                file.write(f"\t{y3}")
+                file.write("\n")
+        print(f"Error Analysis for xi flux rate with lm1 corrected written to {filename}")
 
     # Calculate Landau Free energy?
     if "CalcFE" in locals() and CalcFE:
-        WHAMfactorsMIN = [x[i0min] for x in matrix]
-        sumWM = sum(WHAMfactorsMIN)
-        WHAMfactorsMIN = [val / sumWM for val in WHAMfactorsMIN]
-        # "Semi"-WHAM factors for the [0^-] ensemble
-        WFtot = [a + b for a, b in zip(WHAMfactorsMIN, WHAMfactors)]
-        trajlabels = [int(x[0]) for x in matrix]
-
-        calculate_free_energy(trajlabels, WFtot, inp_dic["trajdir"], folder, histo_stuff)
+        calculate_free_energy(trajlabels, WFtot, inp_dic["trajdir"], folder, histo_stuff, lm1, lambda_interfaces[0], lambda_interfaces[-1], xi_best_estimate, sym)
 
     # Finished!

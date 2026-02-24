@@ -25,6 +25,7 @@ def rec_block_errors(runav, minblocks):
         Rerr = Aerr / bestav
         rel_errors.append(Rerr)
     second_half = rel_errors[len(rel_errors) // 2 :]
-    half_av_err = np.mean(second_half)
-    Nstatineff = (half_av_err / rel_errors[0]) ** 2
+    half_av_err = float(np.mean(second_half))
+    Nstatineff = float((half_av_err / rel_errors[0]) ** 2)
+    rel_errors = [float(x) for x in rel_errors]
     return half_av_err, Nstatineff, rel_errors

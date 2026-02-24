@@ -15,6 +15,7 @@ def wham(
     lamres: Annotated[float, typer.Option("-lamres", help="Resolution along the orderparameter, (intf1-intf0)/10)")] = None,
     nblock: Annotated[int, typer.Option("-nblock", case_sensitive=False, help="Minimal number of blocks in the block-error analysis")] = 5,
     folder: Annotated[str, typer.Option("-folder", help="Output folder")] = "wham",
+    load: Annotated[str, typer.Option("-load", help="Input folder")] = "load",
     fener: Annotated[bool, typer.Option("-fener", help="If set, calculate the conditional free energy. See Wham_")] = False,
     nbx: Annotated[int, typer.Option("-nbx", help="Number of bins in x-direction when calculating the free-energy")] = 100,
     nby: Annotated[int, typer.Option("-nby", help="Same as -nbx but in y-direction")] = None,
@@ -24,6 +25,10 @@ def wham(
     maxy: Annotated[float, typer.Option("-maxy", help="Same as -maxx but in y-direction")] = None,
     xcol: Annotated[int, typer.Option("-xcol", help="What column in order.txt to use as x-value when calculating FE")] = 1,
     ycol: Annotated[int, typer.Option("-ycol", help="Same as -xcol but for y-value")] = None,
+    zmin: Annotated[float, typer.Option("-zmin", help="Min range for DeltaZ region in Å for permeability calculation.")] = None,
+    zmax: Annotated[float, typer.Option("-zmax", help="Max range for DeltaZ region in Å for permeability calculation.")] = None,
+    timestep: Annotated[float, typer.Option("-timestep", help="Time step in fs for flux and permeability calculation.")] = ...,
+    sym: Annotated[bool, typer.Option("-sym", help="If set, symmetrized free energy will be calculated")] = False,
     ):
     """Run Titus0 wham script."""
 
@@ -35,6 +40,10 @@ def wham(
         "lamres": lamres,
         "nblock": nblock,
         "fener": fener,
+        "sym": sym,
+        "zmin": zmin,
+        "zmax": zmax,
+        "timestep": timestep,
         "folder": folder,
         "histo_stuff":{
             "nbx":nbx, "minx":minx, "maxx":maxx, "xcol":xcol,
@@ -49,6 +58,7 @@ def wham(
         print("No toml file, exit.")
         return
     inps["intfs"] = config["simulation"]["interfaces"]
+    inps["subcycle"] = config["engine"].get("subcycles", None)
     if "tis_set" in config["simulation"]:
         inps["lm1"] = config["simulation"]["tis_set"].get("lambda_minus_one", None)
     else:
@@ -57,7 +67,6 @@ def wham(
     if inps["lamres"] is None:
         inps["lamres"] = (inps["intfs"][1] - inps["intfs"][0]) / 10
 
-    if inps["fener"]:
-        inps["trajdir"] = config["simulation"]["load_dir"]
+    inps["trajdir"] = load
 
     run_analysis(inps)
