@@ -3,3 +3,6 @@
 *.pyo
 *.pyd# Byte-compiled / optimized / DLL files
 tags
+test/simdata_dw/
+inftools/*.png
+*.npy
