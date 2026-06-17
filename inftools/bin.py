@@ -17,6 +17,7 @@ from inftools.analysis.plot_histograms import compare_subcycles_publication
 from inftools.analysis.plot_histograms import compare_mass_publication
 from inftools.analysis.plot_histograms import compare_delta_publication
 from inftools.analysis.plot_histograms import compare_grid_publication
+from inftools.analysis.rec_error_staple import error_analysis_staple
 
 # define constants
 MOD_PATH = str(pathlib.Path(__file__).parent.resolve())
@@ -36,6 +37,7 @@ MAPPER["compare_subcycles_publication"] = compare_subcycles_publication
 MAPPER["compare_mass_publication"] = compare_mass_publication
 MAPPER["compare_delta_publication"] = compare_delta_publication
 MAPPER["compare_grid_publication"] = compare_grid_publication
+MAPPER["error_analysis_staple"] = error_analysis_staple
 
 app = typer.Typer(
     no_args_is_help=True,
