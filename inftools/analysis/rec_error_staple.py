@@ -20,10 +20,6 @@ from typing import Annotated, Dict, Optional
 
 import typer
 
-# Adjust path if needed to find tistools
-sys.path = [p for p in sys.path if 'inftools' not in p]
-sys.path.insert(0, os.path.abspath('..'))
-
 
 # =============================================================================
 # OPTIMIZED BLOCK ERROR FUNCTIONS (From Notebook)
@@ -107,7 +103,7 @@ def calculate_infretis_weights(data_file: str, toml_file: str, nskip: int = 0) -
 
     
     # Load data
-    data = np.loadtxt(data_file, dtype=str, usecols=np.arange(37))
+    data = np.loadtxt(data_file, dtype=str, usecols=np.arange(27))
     data = data[nskip:]  # Skip initial entries
     
     # Check if we have ptype information (look for correct patterns)
@@ -377,7 +373,7 @@ def compute_weight_matrices_weights(weight_results: Dict, n_int: Optional[int] =
                                 should_count = True
                             elif j == len(interfaces) - 1:
                                 # should not happen with new implementation
-                                print("nooooo")
+                                # print("nooooo")
                                 k = len(interfaces) - 2  # Last interface self-transition
                                 should_count = True  # Original logic: count RMR paths in last ensemble
                             else:
@@ -700,6 +696,8 @@ def error_analysis_staple(
 
     # Dynamic imports for PyRETIS/tistools topology
     try:
+        sys.path = [p for p in sys.path if 'inftools' not in p]
+        sys.path.insert(0, os.path.abspath('/mnt/0bf0c339-34bb-4500-a5fb-f3c2a863de29/DATA/APPTIS/tistools'))
         from tistools import get_transition_probs_weights, construct_M_istar, global_pcross_msm_star, write_plot_block_error, write_running_estimates
         from tistools import mfpt_to_absorbing_staple, construct_tau_matrix_staple, mfpt_to_absorbing_staple_balanced, mfpt_istar, mfpt_istar_balanced
         # If your notebook used specific tistools extraction functions, import them here
@@ -886,7 +884,10 @@ def error_analysis_staple(
 
             p_mat, q_mat = get_transition_probs_weights(wm3d)
             M_mat    = construct_M_istar(p_mat, max(4, 2 * n_int), n_int)
-            _, _, y1, _ = global_pcross_msm_star(M_mat)
+            try:
+                _, _, y1, _ = global_pcross_msm_star(M_mat)
+            except:
+                y1 = [[np.nan]]
             plocs_out[L] = float(y1[0][0])
             
             if n_int == N_int:
@@ -1019,22 +1020,26 @@ def error_analysis_staple(
     # Compute errors for P_cross (all L interfaces at once)
     log(f"-> Computing P_cross errors...")
     err_pcross = compute_rel_errors_2d(runav_pcross, sizes)
-    write_plot_block_error(simdir / f"pcross_block_errors_{interval}.txt", runav_pcross, err_pcross, interval)
+    print(f"output file: {simdir / f'pcross_block_errors_{interval}'}")
+    write_plot_block_error(str(simdir / f"pcross_block_errors_{interval}"), runav_pcross, err_pcross, interval)
     
     # Compute errors for Q matrix (all N_int x N_int elements at once)
     log(f"-> Computing Q matrix errors (shape: {N_int}x{N_int})...")
     err_qmat = compute_rel_errors_2d(runav_qmat.reshape(len(runav_qmat), -1), sizes)
-    write_plot_block_error(simdir / f"qmat_block_errors_{interval}.txt", runav_qmat, err_qmat, interval)
+    write_plot_block_error(str(simdir / f"qmat_block_errors_{interval}"), runav_qmat.reshape(len(runav_qmat), -1), err_qmat, interval)
     
     # Compute errors for P matrix (MSM)
     log(f"-> Computing P (MSM) matrix errors (shape: {N_int}x{N_int})...")
     err_pmat = compute_rel_errors_2d(runav_pmat.reshape(len(runav_pmat), -1), sizes)
-    write_plot_block_error(simdir / f"pmat_block_errors_{interval}.txt", runav_pmat, err_pmat, interval)
+    write_plot_block_error(str(simdir / f"pmat_block_errors_{interval}"), runav_pmat.reshape(len(runav_pmat), -1), err_pmat, interval)
     
     # Compute errors for rates (flux, MFPT, etc.)
-    log(f"-> Computing rate errors...")
-    err_rate = compute_rel_errors_2d(runav_rate, sizes)
-    write_plot_block_error(simdir / f"rate_block_errors_{interval}.txt", runav_rate, err_rate, interval)
+    if pathlengths:
+        log(f"-> Computing rate errors...")
+        err_rate = compute_rel_errors_2d(runav_rate, sizes)
+        write_plot_block_error(str(simdir / f"rate_block_errors_{interval}"), runav_rate, err_rate, interval)
+    else:
+        err_rate = np.full((len(sizes), 6), np.nan)
 
     # -------------------------------------------------------------------------
     # 4. SUMMARY OUTPUT
@@ -1064,7 +1069,7 @@ def error_analysis_staple(
     Q Matrix Average Rel Error    : {avg_qmat_err:.4f}
     P Matrix Average Rel Error    : {avg_pmat_err:.4f}
     
-    Rate Average Rel Error           : {np.nanmean(err_rate[-1, :]):.4f}
+    Rate Average Rel Error           : {np.nanmean(err_rate[-1, :]) if pathlengths else 'N/A'}
     """
     
     # Only print standard output if not quiet, but always print summary
