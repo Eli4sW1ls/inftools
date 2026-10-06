@@ -1,21 +1,32 @@
 """
-Which CV explains the start-interface dependence of the forward q[i, k]?
+Which CV explains the start-interface dependence of q[i, k]?
 
-q[i, k] (i < k) is the conditional probability that a forward path starting at
-interface i, having reached lambda_{k-1}, also reaches lambda_k. It is computed in
-the notebook (memory_analysis) as
+Forward (--direction fw, i < k-1): q[i, k] is the probability that a forward path
+starting at interface i, having reached lambda_{k-1}, also reaches lambda_k:
 
     q[i, k] = sum_{pe=i+1}^{k} W_pe[i, k:] / sum_{pe=i+1}^{k} W_pe[i, k-1:]
+
+Backward (--direction bw, i > k+1): the probability that a backward path starting at
+i, having reached lambda_{k+1}, also reaches lambda_k:
+
+    q[i, k] = sum_{pe=k+2}^{i+1} W_pe[i, :k+1] / sum_{pe=k+2}^{i+1} W_pe[i, :k+2]
+
+Both as in the notebook (memory_analysis). For backward paths the CV features are
+computed on the mirrored path (lambda -> -lambda), so "first crossing of the
+conditioning interface" means the first crossing of lambda_{k+1} coming down, and
+vz / dop are positive when moving along the path direction. The lambda profiles are
+always shown on the real lambda axis with the raw CV values.
 
 This script
   1. rebuilds the per-path ensemble weights exactly like
      compute_weight_matrices_weights (notebook) and reproduces q[i, k],
   2. extracts the paths that enter q[i, k] for the start interfaces in each group
-     (default groups: i in {0,1}, {2}, {3..10}), with per-path weight
-     W_p = sum_{pe=i+1}^{k} weight_p[pe] and outcome success = (end_intf >= k),
+     (default: the start two interfaces back, i = k-2 / k+2, vs all other starts),
+     with per-path weight W_p = the weight summed over the ensembles of the formula
+     above and outcome success = reached lambda_k,
   3. reads load/<pnr>/order.txt for those paths and computes CV features at the
-     conditioning point (first crossing of lambda_{k-1}), averaged over a window
-     before it, and a few history features,
+     conditioning point (first crossing of lambda_{k-1} / lambda_{k+1}), averaged
+     over a window before it, and a few history features,
   4. reports metrics per CV:
        - group distributions:   weighted mean, SMD and KS distance vs reference group
        - outcome relevance:     weighted AUC of the CV for success (all paths) and
@@ -32,8 +43,9 @@ This script
      P(CV | lambda) (--profile-until-cross: only frames up to the conditioning point).
 
 Usage:
-    python q_cv_discrepancy.py --data-dir <infstapletis dir> [--k 12]
-        [--groups "0,1;2;3-10"] [--nskip 50000] [--window 25] [--outdir DIR]
+    python q_cv_discrepancy.py --data-dir <infstapletis dir> [--direction fw] [--k 12]
+        [--groups "0,1;2;3-10"] [--nskip 0] [--window 25] [--outdir DIR]
+    python q_cv_discrepancy.py --direction bw --k 4 --groups "6;7-13"
 """
 
 import argparse
@@ -101,14 +113,35 @@ def load_path_table(data_dir, nskip):
     return df, weight, interfaces
 
 
-def q_forward(df, weight, i, k):
-    """q[i, k] for i < k as in memory_analysis (notebook)."""
+def cond_interface(direction, k):
+    """Index of the interface q[., k] is conditioned on (lambda_{k-1} or lambda_{k+1})."""
+    return k - 1 if direction == "fw" else k + 1
+
+
+def participants(df, weight, direction, k):
+    """Paths entering q[., k] (all non-trivial start interfaces), weight W and outcome.
+
+    The trivial adjacent start (i = k-1 forward, i = k+1 backward, q = 1) is excluded.
+    """
     n = weight.shape[1]
-    sel = (weight[:, 0] == 0) & (df["start"].values == i) & (df["end"].values >= k - 1)
-    W = weight[sel][:, i + 1:min(k, n - 1) + 1].sum(1)
-    den = W.sum()
-    num = W[df["end"].values[sel] >= k].sum()
-    return num / den if den > 0 else np.nan, sel, W
+    start, end = df["start"].values, df["end"].values
+    non0 = weight[:, 0] == 0
+    if direction == "fw":
+        sel = non0 & (start < k - 1) & (end >= k - 1)
+        # sum over ensembles pe = i+1 .. k
+        lo, hi = start[sel] + 1, np.full(sel.sum(), min(k, n - 1))
+        success = end[sel] >= k
+    else:
+        sel = non0 & (start > k + 1) & (end <= k + 1)
+        # sum over ensembles pe = k+2 .. i+1
+        lo, hi = np.full(sel.sum(), k + 2), np.minimum(start[sel] + 1, n - 1)
+        success = end[sel] <= k
+    cw = np.concatenate([np.zeros((sel.sum(), 1)), np.cumsum(weight[sel], 1)], 1)
+    rows = np.arange(sel.sum())
+    W = np.where(hi >= lo, cw[rows, hi + 1] - cw[rows, lo], 0.0)
+    part = df[sel].copy()
+    part["W"], part["success"] = W, success.astype(int)
+    return part[part["W"] > 0].reset_index(drop=True)
 
 
 def parse_groups(text):
@@ -172,6 +205,9 @@ def path_features(order, lam_start, lam_cross, lam_prev, window, frame_dt):
     A staple path starting at interface a begins with a turn that crosses below
     lambda_a; for a = k-2 that turn starts above lambda_{k-1}, so the conditioning
     crossing is searched only after the path has first been below lambda_a.
+    The averaging window starts no earlier than the last frame below lambda_a, so it
+    covers only the approach from the start interface and never the start turn (which
+    would make the _win features a proxy for the start interface).
     """
     op = order[:, 0]
     below_start = np.nonzero(op < lam_start)[0]
@@ -180,7 +216,8 @@ def path_features(order, lam_start, lam_cross, lam_prev, window, frame_dt):
     if len(above) == 0 or above[0] == 0:
         return None
     c = int(above[0])
-    lo = max(c - window, 0)
+    last_below_start = below_start[below_start < c][-1]
+    lo = max(c - window, int(last_below_start))
     feats = {"cross_frame": c}
     for col, name in enumerate(CV_NAMES[1:], start=1):
         if col >= order.shape[1]:
@@ -193,8 +230,20 @@ def path_features(order, lam_start, lam_cross, lam_prev, window, frame_dt):
     # time since the path was last below lambda_{k-2}: how directly it arrives
     feats["t_since_prev_intf"] = (c - below_prev[-1]) * frame_dt if len(below_prev) else np.nan
     # travel time from the start turn (last time below lambda_a) to the crossing
-    feats["t_from_start_intf"] = (c - below_start[below_start < c][-1]) * frame_dt
+    feats["t_from_start_intf"] = (c - last_below_start) * frame_dt
     return feats
+
+
+def features_for(order, direction, start, k, interfaces, window, frame_dt):
+    """path_features for a forward path, or for the mirrored backward path."""
+    if direction == "fw":
+        return path_features(order, interfaces[start], interfaces[k - 1], interfaces[k - 2],
+                             window, frame_dt)
+    mirrored = order.copy()
+    mirrored[:, 0] *= -1   # lambda
+    mirrored[:, 3] *= -1   # vz: positive = moving along the path direction
+    prev = interfaces[k + 2] if k + 2 < len(interfaces) else np.inf
+    return path_features(mirrored, -interfaces[start], -interfaces[k + 1], -prev, window, frame_dt)
 
 
 # --------------------------------------------------------------------------- #
@@ -379,7 +428,7 @@ def style_axis(ax):
     ax.tick_params(colors="#52514e", labelsize=8)
 
 
-def plot_feature_grid(feat, labels, features, ref, path, nbins=8):
+def plot_feature_grid(feat, labels, features, ref, path, k, cond, nbins=8):
     """Row 1: weighted CV distribution per group. Row 2: q vs CV (quantile bins) per group.
 
     Groups with fewer than 20 paths are drawn as individual paths (rug / outcome dots).
@@ -417,7 +466,7 @@ def plot_feature_grid(feat, labels, features, ref, path, nbins=8):
         style_axis(axes[0, c])
         style_axis(axes[1, c])
     axes[0, 0].set_ylabel("weighted fraction", fontsize=8)
-    axes[1, 0].set_ylabel("P(reach $\\lambda_k$ | $\\lambda_{k-1}$)", fontsize=8)
+    axes[1, 0].set_ylabel(f"P(reach $\\lambda_{{{k}}}$ | $\\lambda_{{{cond}}}$)", fontsize=8)
     handles, labs = axes[1, 0].get_legend_handles_labels()
     fig.legend(handles, labs, loc="upper center", ncol=len(labels), frameon=False, fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
@@ -447,14 +496,14 @@ def plot_explained(metrics, labels, ref, path):
     plt.close(fig)
 
 
-def mark_interfaces(ax, interfaces, k):
+def mark_interfaces(ax, interfaces, k, cond):
     for n, lam in enumerate(interfaces):
-        strong = n in (k - 1, k)
+        strong = n in (cond, k)
         ax.axvline(lam, color="#52514e" if strong else "#d6d5d0", lw=1.0 if strong else 0.6,
                    ls="--" if strong else "-", zorder=0)
 
 
-def plot_lambda_profiles(prof, labels, interfaces, k, path, min_paths=3):
+def plot_lambda_profiles(prof, labels, interfaces, k, cond, path, min_paths=3):
     """One panel per CV: weighted mean CV vs lambda per group (band = +-1 SE)."""
     mean, se, nb = profile_stats(prof)
     centers = 0.5 * (prof["lam_edges"][1:] + prof["lam_edges"][:-1])
@@ -464,7 +513,7 @@ def plot_lambda_profiles(prof, labels, interfaces, k, path, min_paths=3):
     fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.2 * nrow), squeeze=False)
     for col, cv in enumerate(names):
         ax = axes.flat[col]
-        mark_interfaces(ax, interfaces, k)
+        mark_interfaces(ax, interfaces, k, cond)
         for g, lab in enumerate(labels):
             ok = nb[g] >= min_paths
             m, s = np.where(ok, mean[g, col], np.nan), np.where(ok, se[g, col], np.nan)
@@ -477,7 +526,7 @@ def plot_lambda_profiles(prof, labels, interfaces, k, path, min_paths=3):
         ax.set_visible(False)
     handles, labs = axes.flat[0].get_legend_handles_labels()
     fig.suptitle(f"path-averaged CV per $\\lambda$ bin (band ±1 SE, bins with ≥{min_paths} paths; "
-                 f"dashed: $\\lambda_{{{k-1}}}$, $\\lambda_{{{k}}}$)", y=0.99, fontsize=9, color="#52514e")
+                 f"dashed: $\\lambda_{{{cond}}}$, $\\lambda_{{{k}}}$)", y=0.99, fontsize=9, color="#52514e")
     fig.legend(handles, labs, loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=len(labels),
                frameon=False, fontsize=9)
     fig.tight_layout(rect=(0, 0, 1, 0.9))
@@ -485,7 +534,7 @@ def plot_lambda_profiles(prof, labels, interfaces, k, path, min_paths=3):
     plt.close(fig)
 
 
-def plot_lambda_profiles_outcome(prof, labels, interfaces, k, path, min_paths=3):
+def plot_lambda_profiles_outcome(prof, labels, interfaces, k, cond, path, min_paths=3):
     """Rows: CVs, columns: groups. Solid = reaches lambda_k, dashed = turns back.
 
     The y axis is shared along each row; its range follows the plotted means (not the
@@ -500,7 +549,7 @@ def plot_lambda_profiles_outcome(prof, labels, interfaces, k, path, min_paths=3)
         row_means = []
         for g, lab in enumerate(labels):
             ax = axes[col, g]
-            mark_interfaces(ax, interfaces, k)
+            mark_interfaces(ax, interfaces, k, cond)
             for o, ls, name in ((1, "-", f"reaches $\\lambda_{{{k}}}$"), (0, "--", "turns back")):
                 mean, se, nb = stats[o]
                 ok = nb[g] >= min_paths
@@ -524,7 +573,7 @@ def plot_lambda_profiles_outcome(prof, labels, interfaces, k, path, min_paths=3)
     plt.close(fig)
 
 
-def plot_lambda_hist2d(prof, labels, interfaces, k, path, min_paths=3):
+def plot_lambda_hist2d(prof, labels, interfaces, k, cond, path, min_paths=3):
     """Rows: CVs, columns: groups. Colour: P(CV | lambda) (each lambda column normalised);
     line: weighted mean."""
     mean, _, nb = profile_stats(prof)
@@ -546,7 +595,7 @@ def plot_lambda_hist2d(prof, labels, interfaces, k, path, min_paths=3):
                                  shading="flat", rasterized=True)
             ax.plot(centers, np.where(nb[g] >= min_paths, mean[g, col], np.nan),
                     color="#0b0b0b", lw=1.2)
-            for n in (k - 1, k):
+            for n in (cond, k):
                 ax.axvline(interfaces[n], color="#eb6834", lw=1, ls="--")
             ax.tick_params(colors="#52514e", labelsize=7)
             if col == 0:
@@ -566,8 +615,12 @@ def plot_lambda_hist2d(prof, labels, interfaces, k, path, min_paths=3):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    ap.add_argument("--direction", choices=("fw", "bw"), default="fw",
+                    help="forward q (reach lambda_k from lambda_{k-1}) or backward (from lambda_{k+1})")
     ap.add_argument("--k", type=int, default=12, help="target interface of q[:, k]")
-    ap.add_argument("--groups", default="0,1;2;3-10", help="start-interface groups, ';'-separated")
+    ap.add_argument("--groups", default=None,
+                    help="start-interface groups, ';'-separated, e.g. \"0,1;2;3-10\" "
+                         "(default: i=k-2 vs i<k-2 forward, i=k+2 vs i>k+2 backward)")
     ap.add_argument("--ref", type=int, default=-1, help="index of the reference group (default: last)")
     ap.add_argument("--nskip", type=int, default=0)
     ap.add_argument("--window", type=int, default=25, help="frames before the crossing to average over")
@@ -576,41 +629,53 @@ def main():
     ap.add_argument("--nboot", type=int, default=2000)
     ap.add_argument("--lambda-bin", type=float, default=0.5, help="lambda bin width of the CV profiles")
     ap.add_argument("--profile-until-cross", action="store_true",
-                    help="CV profiles only up to the lambda_{k-1} crossing instead of the full path")
+                    help="CV profiles only up to the conditioning crossing instead of the full path")
     ap.add_argument("--min-paths", type=int, default=3, help="min. paths per lambda bin to draw a profile")
     ap.add_argument("--outdir", default=None)
     args = ap.parse_args()
 
     data_dir = pathlib.Path(args.data_dir)
-    k = args.k
-    groups = parse_groups(args.groups)
-    labels = [group_label(g) for g in groups]
-    ref = args.ref % len(groups)
-    outdir = pathlib.Path(args.outdir or f"q_cv_discrepancy_k{k}")
-    outdir.mkdir(parents=True, exist_ok=True)
+    k, direction = args.k, args.direction
+    cond = cond_interface(direction, k)
     rng = np.random.default_rng(0)
 
     df, weight, interfaces = load_path_table(data_dir, args.nskip)
-    print(f"{len(df)} paths after nskip={args.nskip}; lambda_{k-1}={interfaces[k-1]}, "
-          f"lambda_{k}={interfaces[k]}")
+    n_int = len(interfaces)
+    if not 0 <= cond < n_int or not 0 <= k < n_int:
+        raise SystemExit(f"k={k} has no conditioning interface for direction {direction}")
+    if args.groups is None:
+        args.groups = f"{k - 2};0-{k - 3}" if direction == "fw" else f"{k + 2};{k + 3}-{n_int - 1}"
+    groups = parse_groups(args.groups)
+    labels = [group_label(g) for g in groups]
+    ref = args.ref % len(groups)
+    outdir = pathlib.Path(args.outdir or (f"q_cv_discrepancy_k{k}" if direction == "fw"
+                                          else f"q_cv_discrepancy_bw_k{k}"))
+    outdir.mkdir(parents=True, exist_ok=True)
+    print(f"{len(df)} paths after nskip={args.nskip}; {direction}: reach lambda_{k}={interfaces[k]} "
+          f"given lambda_{cond}={interfaces[cond]}")
 
     # ---- 1. reproduce q[i, k] and collect participating paths ------------- #
+    allpart = participants(df, weight, direction, k)
     print(f"\nq[i,{k}] per start interface (notebook formula):")
     print(f"{'i':>3} {'n_paths':>8} {'n_succ':>7} {'neff':>7} {'q':>8}")
     rows = []
     for g, members in enumerate(groups):
         for i in members:
-            q, sel, W = q_forward(df, weight, i, k)
-            sub = df[sel].copy()
-            sub["W"] = W
+            valid = i < k - 1 if direction == "fw" else i > k + 1
+            if not valid:
+                print(f"{i:>3}  skipped: not a non-trivial start interface for {direction} q[i,{k}]")
+                continue
+            sub = allpart[allpart["start"] == i].copy()
             sub["group"] = g
-            sub = sub[sub["W"] > 0]
-            sub["success"] = (sub["end"] >= k).astype(int)
+            q = wmean(sub["success"].values, sub["W"].values) if len(sub) else np.nan
             print(f"{i:>3} {len(sub):>8} {sub['success'].sum():>7} {kish_neff(sub['W'].values):7.1f} {q:8.4f}")
             rows.append(sub)
     part = pd.concat(rows, ignore_index=True)
-    if np.any(part["maxop"].values[part["success"].values == 1] < interfaces[k]):
+    succ = part["success"].values == 1
+    if direction == "fw" and np.any(part["maxop"].values[succ] < interfaces[k]):
         print("warning: some 'successful' paths have maxop < lambda_k")
+    if direction == "bw" and np.any(part["minop"].values[succ] > interfaces[k]):
+        print("warning: some 'successful' paths have minop > lambda_k")
 
     # ---- 2. order.txt and features ---------------------------------------- #
     cache_file = outdir / f"orders_cache_nskip{args.nskip}.npz"
@@ -618,10 +683,10 @@ def main():
     feat_rows = []
     for _, row in part.iterrows():
         order = orders.get(row["pnr"])
-        f = path_features(order, interfaces[row["start"]], interfaces[k - 1], interfaces[k - 2],
-                          args.window, args.frame_dt) if order is not None else None
+        f = features_for(order, direction, int(row["start"]), k, interfaces, args.window,
+                         args.frame_dt) if order is not None else None
         if f is None:
-            print(f"  skipping path {row['pnr']} (no order.txt or no lambda_{k-1} crossing after start turn)")
+            print(f"  skipping path {row['pnr']} (no order.txt or no lambda_{cond} crossing after start turn)")
             continue
         feat_rows.append({**row.to_dict(), **f})
     feat = pd.DataFrame(feat_rows)
@@ -720,9 +785,9 @@ def main():
 
     # ---- 6. figures -------------------------------------------------------- #
     plot_feature_grid(feat, labels, [f for f in features if f.endswith("@cross")], ref,
-                      outdir / "cv_at_crossing.png")
+                      outdir / "cv_at_crossing.png", k, cond)
     plot_feature_grid(feat, labels, [f for f in features if not f.endswith("@cross")], ref,
-                      outdir / "cv_window_history.png")
+                      outdir / "cv_window_history.png", k, cond)
     plot_explained(metrics, labels, ref, outdir / "frac_explained.png")
 
     # ---- 7. CVs vs lambda over the full paths ------------------------------ #
@@ -730,10 +795,12 @@ def main():
     prof = lambda_profiles(feat, orders, lam_edges, cv_edges, len(labels), args.profile_until_cross)
     tag = "_until_cross" if args.profile_until_cross else ""
     profiles_table(prof, labels).to_csv(outdir / f"cv_lambda_profiles{tag}.csv", index=False)
-    plot_lambda_profiles(prof, labels, interfaces, k, outdir / f"cv_vs_lambda{tag}.png", args.min_paths)
-    plot_lambda_profiles_outcome(prof, labels, interfaces, k, outdir / f"cv_vs_lambda_outcome{tag}.png",
-                                 args.min_paths)
-    plot_lambda_hist2d(prof, labels, interfaces, k, outdir / f"cv_vs_lambda_hist2d{tag}.png", args.min_paths)
+    plot_lambda_profiles(prof, labels, interfaces, k, cond, outdir / f"cv_vs_lambda{tag}.png",
+                         args.min_paths)
+    plot_lambda_profiles_outcome(prof, labels, interfaces, k, cond,
+                                 outdir / f"cv_vs_lambda_outcome{tag}.png", args.min_paths)
+    plot_lambda_hist2d(prof, labels, interfaces, k, cond, outdir / f"cv_vs_lambda_hist2d{tag}.png",
+                       args.min_paths)
     print(f"\nWrote tables and figures to {outdir.resolve()}")
 
 

@@ -144,3 +144,4 @@ test/simdata_dw/
 inftools/*.png
 *.npy
 examples/staple_test/q_cv_discrepancy*/
+examples/staple_test/q_memory*/
