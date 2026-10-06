@@ -57,19 +57,20 @@ def _fmt_time(seconds):
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
-def make_progress(cycles, stream=sys.stderr, min_dt=0.2):
+def make_progress(cycles, stream=sys.stderr, min_dt=0.2, work=None, unit="steps", label="cycle"):
     """
-    Progress reporter for the running-estimate loop.
+    Progress reporter for the running-estimate loop (and the path-length pass).
 
     The cost of each step grows with the number of paths it covers (every
     snapshot re-scans the paths from the start), so the ETA is weighted by
     paths done / paths total rather than by step count -- a step-count ETA
     would be wildly optimistic early on. Redraws are throttled to one per
     `min_dt` seconds, since with small intervals there can be many thousands
-    of steps.
+    of steps. Pass `work` to weight the ETA by something other than `cycles`
+    (e.g. uniform per-path cost), and `unit`/`label` to relabel the bar.
     """
-    cycles = np.asarray(cycles, dtype=float)
-    work = np.cumsum(cycles)
+    cycles = np.asarray(cycles)
+    work = np.cumsum(np.asarray(cycles if work is None else work, dtype=float))
     total = len(cycles)
     state = {"t0": time.time(), "last": -np.inf}
 
@@ -85,7 +86,7 @@ def make_progress(cycles, stream=sys.stderr, min_dt=0.2):
         width = 30
         filled = int(width * frac)
         bar = "#" * filled + "." * (width - filled)
-        stream.write(f"\r  [{bar}] {idx + 1:>4}/{total} steps  cycle {int(cycles[idx]):>9}  "
+        stream.write(f"\r  [{bar}] {idx + 1:>4}/{total} {unit}  {label} {int(cycles[idx]):>9}  "
                      f"elapsed {_fmt_time(elapsed):>7}  eta {_fmt_time(eta):>7}  ")
         stream.flush()
         if final:
@@ -175,6 +176,9 @@ def calculate_infretis_weights(data_file: str, toml_file: str, nskip: int = 0) -
     interfaces = toml_config["simulation"]["interfaces"]
     # read lm1 (lambda_minus_one) if present in toml
     lm1 = toml_config.get("simulation", {}).get("tis_set", {}).get("lambda_minus_one", None)
+    # infretis writes `lambda_minus_one = false` when it is disabled
+    if isinstance(lm1, bool):
+        lm1 = None
     if lm1 is not None:
         print(f"read lm1 from toml: {lm1}")
 
@@ -743,6 +747,137 @@ def compute_rel_errors_2d(runavfull, sizes, bestav=None):
 
 
 # =============================================================================
+# PATH LENGTHS (ported from infretis_istar_workflow.ipynb)
+# =============================================================================
+def load_order_from_path(path_dir):
+    """Load the order parameters of one path from <path_dir>/order.txt (time column dropped)."""
+    order_file = Path(path_dir) / "order.txt"
+    if not order_file.exists():
+        return None
+    try:
+        data = np.loadtxt(order_file, comments='#')
+    except Exception:
+        return None
+    if data.ndim == 1:
+        # A single line: [time, op, ...]
+        data = data.reshape(1, -1)
+    return data[:, 1:] if data.shape[1] > 1 else data
+
+
+def compute_path_taus(weight_results: Dict, load_dir, lm1=None, cache_file=None,
+                      recompute: bool = False, progress_factory=None) -> Dict:
+    """
+    Compute tau, tau1, tau2 and taum for every path and store them in
+    weight_results['path_data'] (keys 'tau', 'tau1', 'tau2', 'taum', 'has_tau').
+
+    Merges the notebook's `load_path_order_data` and `compute_path_taus` into
+    a single pass, so the order parameters of all paths are never held in
+    memory at once. Per-path results are cached by path number in
+    `cache_file` (.npz); only paths missing from the cache are read from
+    <load_dir>/<pnr>/order.txt, so rerunning on a growing simulation only
+    reads the new paths. The cache is discarded if the interfaces or lm1
+    have changed.
+    """
+    from tistools import get_tau_staple, get_tau1_staple, get_tau2_staple
+
+    D = weight_results['path_data']
+    interfaces = weight_results['interfaces']
+    pnrs = np.asarray(D['pnr']).ravel().astype(np.int64)
+    n_paths = len(pnrs)
+    start_intfs = np.asarray(D['start_intf']).astype(int)
+    end_intfs = np.asarray(D['end_intf']).astype(int)
+
+    # tau, tau1, tau2, has_tau per path number
+    cache = {}
+    if cache_file is not None and Path(cache_file).exists() and not recompute:
+        try:
+            c = np.load(cache_file)
+            same_intf = np.allclose(c['interfaces'], interfaces)
+            c_lm1 = float(c['lm1'])
+            same_lm1 = (np.isnan(c_lm1) and lm1 is None) or (lm1 is not None and c_lm1 == lm1)
+            if same_intf and same_lm1:
+                cache = {int(p): (t, t1, t2, h) for p, t, t1, t2, h in
+                         zip(c['pnr'], c['tau'], c['tau1'], c['tau2'], c['has_tau'])}
+        except Exception:
+            cache = {}
+
+    tau = np.zeros(n_paths)
+    tau1 = np.zeros(n_paths)
+    tau2 = np.zeros(n_paths)
+    has_tau = np.zeros(n_paths, dtype=bool)
+
+    todo = []
+    for i, pn in enumerate(pnrs):
+        hit = cache.get(int(pn))
+        if hit is None:
+            todo.append(i)
+        else:
+            tau[i], tau1[i], tau2[i], has_tau[i] = hit
+
+    n_missing = n_error = 0
+    progress = progress_factory(pnrs[todo]) if (progress_factory and todo) else None
+    for step, i in enumerate(todo):
+        orders = load_order_from_path(Path(load_dir) / str(pnrs[i]))
+        if orders is None:
+            n_missing += 1
+        else:
+            start, end = start_intfs[i], end_intfs[i]
+            try:
+                tau[i] = get_tau_staple(orders, start, end, interfaces, lm1=lm1)
+                tau1[i] = get_tau1_staple(orders, start, end, interfaces, lm1=lm1)
+                tau2[i] = get_tau2_staple(orders, start, end, interfaces, lm1=lm1)
+                has_tau[i] = True
+            except Exception:
+                n_error += 1
+        if progress is not None:
+            progress(step)
+
+    if cache_file is not None and todo:
+        for i in todo:
+            cache[int(pnrs[i])] = (tau[i], tau1[i], tau2[i], has_tau[i])
+        keys = np.fromiter(cache.keys(), dtype=np.int64)
+        vals = np.array(list(cache.values()), dtype=float).reshape(-1, 4)
+        np.savez(cache_file, pnr=keys, tau=vals[:, 0], tau1=vals[:, 1], tau2=vals[:, 2],
+                 has_tau=vals[:, 3].astype(bool), interfaces=np.asarray(interfaces, dtype=float),
+                 lm1=np.nan if lm1 is None else float(lm1))
+
+    D['tau'] = tau
+    D['tau1'] = tau1
+    D['tau2'] = tau2
+    D['taum'] = tau - tau1 - tau2
+    D['has_tau'] = has_tau
+
+    return {
+        'n_paths': n_paths,
+        'n_cached': n_paths - len(todo),
+        'n_read': len(todo) - n_missing,
+        'n_missing': n_missing,
+        'n_error': n_error,
+        'n_with_tau': int(has_tau.sum()),
+    }
+
+
+def compute_xi_running(D: Dict) -> np.ndarray:
+    """
+    Running estimate of the lm1 correction factor xi for every prefix of the paths.
+
+    Ptype branch of the notebook's `compute_xi_from_trajs`: of the [0-] paths
+    (weighted by their ensemble-0 occurrence path_f[:, 0]), xi is the fraction
+    that ends on the right (LMR, RMR) rather than the left (LML, RML).
+    Returns xi[n] for the first n + 1 paths (NaN until a [0-] path ends).
+    """
+    ptype = np.asarray(D['ptype']).astype(str)
+    fac = np.asarray(D['path_f'])[:, 0].astype(float)
+    ptype = np.where(ptype == 'L*L', 'LML', np.where(ptype == 'R*R', 'RMR', ptype))
+    r_end = np.where(np.isin(ptype, ['LMR', 'RMR']), fac, 0.0)
+    l_end = np.where(np.isin(ptype, ['LML', 'RML']), fac, 0.0)
+    r_cum = np.cumsum(r_end)
+    tot_cum = r_cum + np.cumsum(l_end)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(tot_cum > 0, r_cum / tot_cum, np.nan)
+
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 
@@ -752,7 +887,10 @@ def error_analysis_staple(
     toml_file: Annotated[Optional[str], typer.Option("--toml-file", help="Path to infretis.toml (default: <simdir>/infretis.toml)")] = None,
     nskip: Annotated[int, typer.Option("--nskip", help="Number of initial path entries to skip (default: 0)")] = 0,
     interval: Annotated[int, typer.Option("-i", "--interval", help="Interval between running estimates in paths (default: 1). Cost grows as ~n_paths^2/interval.")] = 1,
-    pathlengths: Annotated[bool, typer.Option("--pathlengths", help="Also compute running flux/MFPT/rate estimates from the path lengths")] = False,
+    pathlengths: Annotated[bool, typer.Option("--pathlengths", help="Also compute running flux/MFPT/rate estimates (balanced tau1/tau2) from the path lengths in <load-dir>/<pnr>/order.txt")] = False,
+    load_dir: Annotated[Optional[str], typer.Option("--load-dir", help="Directory with one <pnr>/order.txt per path, used by --pathlengths (default: <simdir>/load)")] = None,
+    time_unit: Annotated[float, typer.Option("--time-unit", help="Factor converting engine time units (timestep from infretis.toml) to the reported unit, e.g. 1e-12 for ps -> s (default: 1, report in engine time units)")] = 1.0,
+    recompute_taus: Annotated[bool, typer.Option("--recompute-taus", help="Ignore the cached per-path taus (<outdir>/path_taus.npz) and reread every order.txt")] = False,
     outdir: Annotated[Optional[str], typer.Option("--outdir", help="Directory to save running estimates, block errors and plots in (default: <simdir>)")] = None,
     output: Annotated[Optional[str], typer.Option("-o", "--output", help="Output file for the report (default: stdout)")] = None,
     verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Do not suppress the (very chatty) output of the weight/tistools routines")] = False,
@@ -804,6 +942,24 @@ def error_analysis_staple(
     log(f"Output dir      : {outdir}")
     log(f"Interval        : {interval} paths")
     log(f"Skip from start : {nskip}")
+    if pathlengths:
+        load_dir = Path(load_dir).resolve() if load_dir else simdir / "load"
+        if not load_dir.is_dir():
+            print(f"Error: Directory {load_dir} does not exist (needed for --pathlengths)", file=sys.stderr)
+            sys.exit(1)
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        with open(toml_file, "rb") as ft:
+            engine = tomllib.load(ft).get("engine", {})
+        timestep = float(engine.get("timestep", 1.0))
+        subcycles = int(engine.get("subcycles", 1))
+        # tau is counted in stored frames, which are `subcycles` MD steps apart
+        time_fac = timestep * subcycles * time_unit
+        log(f"Load dir        : {load_dir}")
+        log(f"Time per frame  : {timestep} x {subcycles} subcycles x {time_unit} = {time_fac:.6g}"
+            + ("" if "timestep" in engine else "  (!! no [engine] timestep in toml, using 1)"))
     log()
 
     # -------------------------------------------------------------------------
@@ -834,12 +990,32 @@ def error_analysis_staple(
     k_raw_full   = D["end_intf"].astype(np.intp)
     
     if pathlengths:
-        # TODO
+        if 'ptype' not in D:
+            print("Error: --pathlengths needs ptype information in infretis_data.txt", file=sys.stderr)
+            sys.exit(1)
+        print(f"  loaded in {_fmt_time(time.time() - t_load)}", file=sys.stderr)
+        print("Computing path lengths...", file=sys.stderr)
+        t_tau = time.time()
+        tau_factory = None if quiet_progress else (
+            lambda pn: make_progress(pn, work=np.ones(len(pn)), unit="paths", label="pnr"))
+        tau_info = compute_path_taus(weight_results, load_dir, lm1=lm1,
+                                     cache_file=outdir / "path_taus.npz",
+                                     recompute=recompute_taus, progress_factory=tau_factory)
+        print(f"  path lengths done in {_fmt_time(time.time() - t_tau)} "
+              f"({tau_info['n_cached']} cached, {tau_info['n_read']} read)", file=sys.stderr)
+        log(f"Path lengths    : {tau_info['n_with_tau']}/{N_paths} paths "
+            f"({tau_info['n_cached']} from cache, {tau_info['n_read']} read from order.txt)")
+        if tau_info['n_missing'] or tau_info['n_error']:
+            log(f"  !! {tau_info['n_missing']} paths without order.txt and {tau_info['n_error']} "
+                f"failed tau computations; these keep their weight in P/Q but are left out of the tau averages")
+        has_tau_full = D["has_tau"]
         tau_full     = D["tau"]
         tau1_full    = D["tau1"]
         tau2_full    = D["tau2"]
         taum_full    = D["taum"]
-    
+        # lm1 correction of the [0-] times: running xi from the ptype counts
+        xi_full = compute_xi_running(D) if lm1 is not None else None
+
     # Define our snapshots based on interval
     start_cyc = max(10, interval)
     nskip_arr = np.arange(start_cyc, N_paths, interval, dtype=np.intp)
@@ -869,8 +1045,11 @@ def error_analysis_staple(
         log(f"  (note: only {n_snapshots} estimates; block lengths sweep to {n_snapshots // 5}, "
             f"which may be too few to show a plateau)")
     log()
-    print(f"  loaded in {_fmt_time(time.time() - t_load)}; "
-          f"{n_snapshots} running-estimate steps to go", file=sys.stderr)
+    if pathlengths:
+        print(f"  {n_snapshots} running-estimate steps to go", file=sys.stderr)
+    else:
+        print(f"  loaded in {_fmt_time(time.time() - t_load)}; "
+              f"{n_snapshots} running-estimate steps to go", file=sys.stderr)
     
     # ── 2. Global norm_factor (unchanged across all subsets) ────
     path_w_c     = np.minimum(path_w_full, 1.0)
@@ -888,37 +1067,93 @@ def error_analysis_staple(
     not_ens0_full = ~is_ens0_full
 
     # ── 3. Helper: build wm3d + compute ploc + rates for one subset ─────
+    RATE_LABELS = ["Flux", "Flux_nb", "MFPT_AB", "MFPT_nb_AB", "Rate", "Rate_nb"]
+
+    def _rates_from_taus(M_mat, tsum3d, tw3d, pcross, xi):
+        """
+        Flux, MFPT(A->B) and rate from the running tau sums, balanced
+        (tau1/tau2 pooled per turn point, weighted by the data behind each)
+        and non-balanced (tau2 only), as in the notebook's MFPT/flux cells.
+        """
+        nan_out = np.full(len(RATE_LABELS), np.nan)
+        if xi is not None and not (np.isfinite(xi) and xi > 0):
+            return nan_out
+
+        # (N+1) x N interface-space matrices: row 0 = [0-] (ensemble 0),
+        # rows 1..N = start interface 0..N-1, summed over ensembles 1..N-1.
+        tw_2d = np.zeros((N_int + 1, N_int))
+        ts_2d = np.zeros((N_int + 1, N_int, 4))
+        tw_2d[0, 0] = tw3d[0][0, 0]
+        ts_2d[0, 0] = tsum3d[0][0, 0]
+        for ens in range(1, N_int):
+            tw_2d[1:] += tw3d[ens]
+            ts_2d[1:] += tsum3d[ens]
+        avg = np.zeros_like(ts_2d)
+        nz = tw_2d > 0
+        avg[nz] = ts_2d[nz] / tw_2d[nz][:, None]
+        p_tau = {'tau': avg[..., 0], 'tau1': avg[..., 1], 'tau2': avg[..., 2],
+                 'taum': avg[..., 3], 'weights': tw_2d}
+
+        # lm1 correction: only part of the [0-] time is spent beyond lm1
+        taum_xi = p_tau['taum'].copy()
+        tau_0m = p_tau['tau'][0, 0]
+        if xi is not None:
+            taum_xi[0, 0] /= xi
+            tau_0m /= xi
+
+        NS = len(M_mat)
+        N = NS // 2
+        absor = [NS - 1]
+        kept = list(range(NS - 1))
+        try:
+            # tau[0+], the excursion out of A (h1[0][0], absorbing in 0, 1 and NS-1)
+            tau_0p = mfpt_istar_balanced(M_mat, p_tau)[2][0][0]
+            tau_0p_nb = mfpt_istar(M_mat, p_tau)[2][0][0]
+            # MFPT A -> B: absorbing in the last state, read off h2[0][0] (kept[0]
+            # is state 0) with the dwell in A kept in (remove_initial_m=False)
+            _, _, _, h2 = mfpt_to_absorbing_staple_balanced(
+                M_mat, p_tau['tau1'], taum_xi, p_tau['tau2'], absor, kept,
+                weights=tw_2d, remove_initial_m=False)
+            _, _, _, h2_nb = mfpt_to_absorbing_staple(
+                M_mat, construct_tau_matrix_staple(p_tau['tau1'], N),
+                construct_tau_matrix_staple(taum_xi, N),
+                construct_tau_matrix_staple(p_tau['tau2'], N),
+                absor, kept, remove_initial_m=False)
+        except (np.linalg.LinAlgError, ValueError):
+            return nan_out
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            flux = 1.0 / ((tau_0m + tau_0p) * time_fac)
+            flux_nb = 1.0 / ((tau_0m + tau_0p_nb) * time_fac)
+        mfpt_AB = h2[0][0] * time_fac
+        mfpt_nb_AB = h2_nb[0][0] * time_fac
+        return np.array([flux, flux_nb, mfpt_AB, mfpt_nb_AB, flux * pcross, flux_nb * pcross])
+
     def _all_plocs_and_rates_from_prefix(n_rows: int):
         plocs_out = np.ones(N_int)
 
         j_raw_sub  = j_raw_full[:n_rows]
         k_raw_sub  = k_raw_full[:n_rows]
         wk_sub     = weight_k_full[:n_rows]
-        if pathlengths:
-            tau_sub    = tau_full[:n_rows]
-            tau1_sub   = tau1_full[:n_rows]
-            tau2_sub   = tau2_full[:n_rows]
-            taum_sub   = taum_full[:n_rows]
-
         not_e0_sub = not_ens0_full[:n_rows]
         is_e0_sub  = is_ens0_full[:n_rows]
-        
-        # We will also compute rate/flux using the global N_int matrix
-        t3d  = {ens: np.zeros((N_int, N_int)) for ens in range(N_int)}
-        t1_3d = {ens: np.zeros((N_int, N_int)) for ens in range(N_int)}
-        t2_3d = {ens: np.zeros((N_int, N_int)) for ens in range(N_int)}
-        tm_3d = {ens: np.zeros((N_int, N_int)) for ens in range(N_int)}
+
+        if pathlengths:
+            # Weighted sums of [tau, tau1, tau2, taum] per ensemble and
+            # (start, end), plus the weight behind them. Only paths with a
+            # computed tau enter, so a missing order.txt does not drag the
+            # averages towards zero.
+            taus_sub = np.stack([tau_full[:n_rows], tau1_full[:n_rows],
+                                 tau2_full[:n_rows], taum_full[:n_rows]], axis=1)
+            ht_sub   = has_tau_full[:n_rows]
+            tsum3d   = {ens: np.zeros((N_int, N_int, 4)) for ens in range(N_int)}
+            tw3d     = {ens: np.zeros((N_int, N_int)) for ens in range(N_int)}
+            m_e0 = is_e0_sub & ht_sub
+            w_e0 = wk_sub[m_e0, 0]
+            tsum3d[0][0, 0] = w_e0 @ taus_sub[m_e0]
+            tw3d[0][0, 0] = w_e0.sum()
 
         ens0_w = float(wk_sub[is_e0_sub, 0].sum())
-        
-        # Compute tau expectations for ensemble 0
-        if pathlengths:
-                mask_e0 = is_e0_sub
-                wm_e0 = wk_sub[mask_e0, 0]
-                t3d[0][0, 0] = (wm_e0 * tau_sub[mask_e0]).sum()
-                t1_3d[0][0, 0] = (wm_e0 * tau1_sub[mask_e0]).sum()
-                t2_3d[0][0, 0] = (wm_e0 * tau2_sub[mask_e0]).sum()
-                tm_3d[0][0, 0] = (wm_e0 * taum_sub[mask_e0]).sum()
 
         for n_int in range(2, N_int + 1):
             L = n_int - 1
@@ -943,132 +1178,44 @@ def error_analysis_staple(
                 jm = j_clipped[mask]
                 km = k_clipped[mask]
                 wm = w_ens[mask]
-                
-                if pathlengths:
-                    t_m = tau_sub[mask]
-                    t1_m = tau1_sub[mask]
-                    t2_m = tau2_sub[mask]
-                    tm_m = taum_sub[mask]
 
+                # Self-transitions only count at 0 -> [0, 0] and L -> [L, L-1]
                 self_m = jm == km
-                if np.any(self_m):
-                    m_0 = self_m & (jm == 0)
-                    wm3d[ens][0, 0] += wm[m_0].sum()
-                    if n_int == N_int and pathlengths:
-                        t3d[ens][0, 0] += (wm[m_0] * t_m[m_0]).sum()
-                        t1_3d[ens][0, 0] += (wm[m_0] * t1_m[m_0]).sum()
-                        t2_3d[ens][0, 0] += (wm[m_0] * t2_m[m_0]).sum()
-                        tm_3d[ens][0, 0] += (wm[m_0] * tm_m[m_0]).sum()
-                        
-                    if L > 0:
-                        mL = self_m & (jm == L)
-                        wm3d[ens][L, L - 1] += wm[mL].sum()
-                        if n_int == N_int and pathlengths:
-                            t3d[ens][L, L - 1] += (wm[mL] * t_m[mL]).sum()
-                            t1_3d[ens][L, L - 1] += (wm[mL] * t1_m[mL]).sum()
-                            t2_3d[ens][L, L - 1] += (wm[mL] * t2_m[mL]).sum()
-                            tm_3d[ens][L, L - 1] += (wm[mL] * tm_m[mL]).sum()
-
+                m_0 = self_m & (jm == 0)
+                m_L = self_m & (jm == L)
+                wm3d[ens][0, 0] += wm[m_0].sum()
+                wm3d[ens][L, L - 1] += wm[m_L].sum()
                 off = ~self_m
-                if np.any(off):
-                    np.add.at(wm3d[ens], (jm[off], km[off]), wm[off])
-                    if n_int == N_int and pathlengths:
-                        np.add.at(t3d[ens], (jm[off], km[off]), wm[off] * t_m[off])
-                        np.add.at(t1_3d[ens], (jm[off], km[off]), wm[off] * t1_m[off])
-                        np.add.at(t2_3d[ens], (jm[off], km[off]), wm[off] * t2_m[off])
-                        np.add.at(tm_3d[ens], (jm[off], km[off]), wm[off] * tm_m[off])
+                np.add.at(wm3d[ens], (jm[off], km[off]), wm[off])
+
+                if pathlengths and n_int == N_int:
+                    # Same cells as wm3d, restricted to paths with a tau
+                    keep = (off | m_0 | m_L) & ht_sub[mask]
+                    kt = np.where(m_L, L - 1, km)[keep]
+                    jt = jm[keep]
+                    wt = wm[keep]
+                    np.add.at(tw3d[ens], (jt, kt), wt)
+                    np.add.at(tsum3d[ens], (jt, kt), wt[:, None] * taus_sub[mask][keep])
 
             p_mat, q_mat = get_transition_probs_weights(wm3d)
             M_mat    = construct_M_istar(p_mat, max(4, 2 * n_int), n_int)
             try:
                 _, _, y1, _ = global_pcross_msm_star(M_mat)
-            except:
+            except Exception:
                 y1 = [[np.nan]]
             plocs_out[L] = float(y1[0][0])
-            
-            if n_int == N_int:
-                # We also compute the rates using the N_int dimensional M_mat & wm3d
-                M_mat_N = M_mat
 
-        # Now compute 2D tau arrays
+        # p_mat, q_mat and M_mat now belong to the full n_int == N_int model
         if not pathlengths:
-            return plocs_out, p_mat, q_mat, (None, None, None, None, None, None)
-        
-        ws_2d = np.zeros((N_int + 1, N_int))
-        ts_2d = np.zeros((N_int + 1, N_int))
-        t1s_2d = np.zeros((N_int + 1, N_int))
-        t2s_2d = np.zeros((N_int + 1, N_int))
-        tms_2d = np.zeros((N_int + 1, N_int))
-        
-        ws_2d[0, 0] = wm3d[0][0, 0]
-        ts_2d[0, 0] = t3d[0][0, 0]
-        t1s_2d[0, 0] = t1_3d[0][0, 0]
-        t2s_2d[0, 0] = t2_3d[0][0, 0]
-        tms_2d[0, 0] = tm_3d[0][0, 0]
-        
-        for i in range(1, N_int):
-            ws_2d[1:, :] += wm3d[i]
-            ts_2d[1:, :] += t3d[i]
-            t1s_2d[1:, :] += t1_3d[i]
-            t2s_2d[1:, :] += t2_3d[i]
-            tms_2d[1:, :] += tm_3d[i]
-            
-        mask = ws_2d > 0
-        t_avg = np.zeros_like(ws_2d)
-        t1_avg = np.zeros_like(ws_2d)
-        t2_avg = np.zeros_like(ws_2d)
-        tm_avg = np.zeros_like(ws_2d)
-        
-        t_avg[mask] = ts_2d[mask] / ws_2d[mask]
-        t1_avg[mask] = t1s_2d[mask] / ws_2d[mask]
-        t2_avg[mask] = t2s_2d[mask] / ws_2d[mask]
-        tm_avg[mask] = tms_2d[mask] / ws_2d[mask]
-        
-        p_tau = {
-            'tau': t_avg, 'tau1': t1_avg, 'tau2': t2_avg, 'taum': tm_avg
-        }
-        
-        #TODO
-        dt = 1.0  # Time step in ps (adjust as needed)
-        subc = 1.0  # Subcycles (adjust as needed)
-        absor = [N_int - 1]  # Absorbing states
-        kept = list(range(N_int-1))  # All states kept
-        xi_val = 1
-        
-        mfpt_bal = mfpt_istar_balanced(M_mat_N, p_tau)
-        mfpt_0 = mfpt_bal[2][0][0]
-        mfpt_nb_obj = mfpt_istar(M_mat_N, p_tau)
-        mfpt_nb_0 = mfpt_nb_obj[2][0][0]
-        
-        p_taumm = p_tau['taum'].copy()
-        if xi_val is not None:
-            p_taumm[0,0] /= xi_val
-        t1m = construct_tau_matrix_staple(p_tau['tau1'], N_int)
-        tmm = construct_tau_matrix_staple(p_taumm, N_int)
-        t2m = construct_tau_matrix_staple(p_tau['tau2'], N_int)
-        
-        _, _, h1mfpt, _ = mfpt_to_absorbing_staple_balanced(M_mat_N, p_tau['tau1'], p_taumm, p_tau['tau2'], absor, kept)
-        _, _, h1mfpt_nb, _ = mfpt_to_absorbing_staple(M_mat_N, t1m, tmm, t2m, absor, kept)
-        
-        mfpt_AB = h1mfpt[0][0] * dt * subc * 1e-12
-        mfpt_nb_AB = h1mfpt_nb[0][0] * dt * subc * 1e-12
-        
-        tau_z0 = p_tau['tau'][0,0]/xi_val if xi_val is not None else p_tau['tau'][0,0]
-        flux = 1 / ((tau_z0 + mfpt_0) * dt * subc * 1e-12)
-        flux_nb = 1 / ((tau_z0 + mfpt_nb_0) * dt * subc * 1e-12)
-        
-        rate = flux * plocs_out[-1]
-        rate_nb = flux_nb * plocs_out[-1]
-        print(f"rate = {rate:.6e}  |  rate_nb = {rate_nb:.6e}")
-        
-        return plocs_out, p_mat, q_mat, (flux, flux_nb, mfpt_AB, mfpt_nb_AB, rate, rate_nb)
-
+            return plocs_out, p_mat, q_mat, np.full(len(RATE_LABELS), np.nan)
+        xi = None if xi_full is None else xi_full[n_rows - 1]
+        return plocs_out, p_mat, q_mat, _rates_from_taus(M_mat, tsum3d, tw3d, plocs_out[-1], xi)
 
     # -------------------------------------------------------------------------
     # 2. RUNNING AVERAGE LOOP
     # -------------------------------------------------------------------------
     ploc_MSM_stored = np.full((n_snapshots, N_int), np.nan)
-    rate_stored = np.full((n_snapshots, 6), np.nan)
+    rate_stored = np.full((n_snapshots, len(RATE_LABELS)), np.nan)
     cycles = []
 
     progress = None if quiet_progress else make_progress(nskip_arr)
@@ -1091,8 +1238,10 @@ def error_analysis_staple(
     with quiet(not verbose):
         for fname, (data, label) in runav_files.items():
             write_running_estimates(outdir / fname, cycles, data, label)
-        write_running_estimates(outdir / "rate_runav.txt", cycles, rate_stored[:, 0], "Flux", rate_stored[:, 1], "Flux_nb", rate_stored[:, 2], "MFPT_AB", rate_stored[:, 3], "MFPT_nb_AB", rate_stored[:, 4], "Rate", rate_stored[:, 5], "Rate_nb")
-    written = list(runav_files) + ["rate_runav.txt"]
+        if pathlengths:
+            rate_cols = [x for i, lab in enumerate(RATE_LABELS) for x in (rate_stored[:, i], lab)]
+            write_running_estimates(outdir / "rate_runav.txt", cycles, *rate_cols)
+    written = list(runav_files) + (["rate_runav.txt"] if pathlengths else [])
 
     # -------------------------------------------------------------------------
     # 3. VECTORIZED BLOCK ERROR ANALYSIS
@@ -1106,10 +1255,15 @@ def error_analysis_staple(
     runav_pcross = ploc_MSM_stored[valid_rows][trim_start:]
     runav_qmat   = q_mat_stored[valid_rows][trim_start:]
     runav_pmat   = p_mat_stored[valid_rows][trim_start:]
-    runav_rate   = rate_stored[valid_rows][trim_start:]
+    # Rates are NaN until every piece they need has been sampled (e.g. no
+    # [0-] path has ended yet for xi), so they get their own valid rows
+    rate_rows    = valid_rows & np.all(np.isfinite(rate_stored), axis=1)
+    runav_rate   = rate_stored[rate_rows][trim_start:]
     
     maxbll = len(runav_pcross) // 5
     sizes  = np.arange(1, maxbll + 1, dtype=np.intp)
+    maxbll_rate = len(runav_rate) // 5
+    sizes_rate  = np.arange(1, maxbll_rate + 1, dtype=np.intp)
 
     if maxbll >= 1:
         print("Computing block errors...", file=sys.stderr)
@@ -1122,13 +1276,17 @@ def error_analysis_staple(
             ("qmat", runav_qmat.reshape(len(runav_qmat), -1)),
             ("pmat", runav_pmat.reshape(len(runav_pmat), -1)),
         ]
-        if pathlengths:
+        do_rates = pathlengths and maxbll_rate >= 1
+        if do_rates:
             block_sets.append(("rate", runav_rate))
+            log(f"Using {len(runav_rate)} snapshots with finite rates for the rate error analysis")
+        elif pathlengths:
+            log(f"!! Only {len(runav_rate)} snapshots with finite rates: skipping rate block errors")
 
         errs = {}
         with quiet(not verbose):
             for name, runav in block_sets:
-                errs[name] = compute_rel_errors_2d(runav, sizes)
+                errs[name] = compute_rel_errors_2d(runav, sizes_rate if name == "rate" else sizes)
                 write_plot_block_error(str(outdir / f"{name}_block_errors_{interval}"), runav, errs[name], interval)
                 written.append(f"{name}_block_errors_{interval}.txt / .png")
         print(f"  block errors done in {_fmt_time(time.time() - t_block)}", file=sys.stderr)
@@ -1136,7 +1294,6 @@ def error_analysis_staple(
         err_pcross = errs["pcross"]
         err_qmat = errs["qmat"]
         err_pmat = errs["pmat"]
-        err_rate = errs.get("rate", np.full((len(sizes), 6), np.nan))
 
         # ---------------------------------------------------------------------
         # 4. SUMMARY OUTPUT
@@ -1166,8 +1323,25 @@ def error_analysis_staple(
     Q Matrix Average Rel Error    : {avg_qmat_err:.4f}
     P Matrix Average Rel Error    : {avg_pmat_err:.4f}
     
-    Rate Average Rel Error           : {np.nanmean(err_rate[-1, :]) if pathlengths else 'N/A'}
     """
+        if do_rates:
+            # Per quantity: final running estimate and plateau relative error
+            err_rate = errs["rate"]
+            plateau_rate = sizes_rate > maxbll_rate // 2
+            rel_rate = (err_rate[plateau_rate].mean(axis=0) if plateau_rate.any()
+                        else err_rate[-1])
+            best_rate = runav_rate[-1]
+            unit = "engine time units" if time_unit == 1.0 else f"engine time units x {time_unit:g}"
+            rows = [f"    {lab:<12}: {val:>13.6e}  +- {val * rel:.3e}  ({rel * 100:.2f}%)"
+                    for lab, val, rel in zip(RATE_LABELS, best_rate, rel_rate)]
+            summary += (
+                f"\n    Rates (time in {unit}; _nb = tau2 only, not balanced):\n"
+                f"    ---------------------------------------------------\n"
+                + "\n".join(rows)
+                + f"\n    1/MFPT_AB    : {1 / best_rate[2]:>13.6e}  (should match Rate)"
+                + (f"\n    xi (lm1)     : {xi_full[nskip_arr[-1] - 1]:.6g}" if xi_full is not None else "")
+                + "\n"
+            )
         log(summary)
         # The report went to a file: still show the summary on the terminal.
         if output:
