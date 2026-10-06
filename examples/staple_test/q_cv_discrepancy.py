@@ -364,7 +364,7 @@ def main():
     ap.add_argument("--k", type=int, default=12, help="target interface of q[:, k]")
     ap.add_argument("--groups", default="0,1;2;3-10", help="start-interface groups, ';'-separated")
     ap.add_argument("--ref", type=int, default=-1, help="index of the reference group (default: last)")
-    ap.add_argument("--nskip", type=int, default=50000)
+    ap.add_argument("--nskip", type=int, default=0)
     ap.add_argument("--window", type=int, default=25, help="frames before the crossing to average over")
     ap.add_argument("--frame-dt", type=float, default=0.2, help="time between order.txt frames (dt*subcycles)")
     ap.add_argument("--nperm", type=int, default=20000)
