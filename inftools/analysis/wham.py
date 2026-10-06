@@ -14,7 +14,7 @@ def wham(
     lamres: Atd[float, Opt("-lamres", help="Resolution along the orderparameter, (intf1-intf0)/10)")] = None,
     nblock: Atd[int, Opt("-nblock", case_sensitive=False, help="Minimal number of blocks in the block-error analysis")] = 5,
     folder: Atd[str, Opt("-folder", help="Output folder")] = "wham",
-    load: Annotated[str, typer.Option("-load", help="Input folder")] = "load",
+    load: Atd[str, Opt("-load", help="Input folder")] = "load",
     fener: Atd[bool, Opt("-fener", help="If set, calculate the conditional free energy. See Wham_")] = False,
     nbx: Atd[int, Opt("-nbx", help="Number of bins in x-direction when calculating the free-energy")] = 100,
     nby: Atd[int, Opt("-nby", help="Same as -nbx but in y-direction")] = None,
@@ -24,10 +24,10 @@ def wham(
     maxy: Atd[float, Opt("-maxy", help="Same as -maxx but in y-direction")] = None,
     xcol: Atd[int, Opt("-xcol", help="What column in order.txt to use as x-value when calculating FE")] = 1,
     ycol: Atd[int, Opt("-ycol", help="Same as -xcol but for y-value")] = None,
-    zmin: Annotated[float, typer.Option("-zmin", help="Min range for DeltaZ region in Å for permeability calculation.")] = None,
-    zmax: Annotated[float, typer.Option("-zmax", help="Max range for DeltaZ region in Å for permeability calculation.")] = None,
-    timestep: Annotated[float, typer.Option("-timestep", help="Time step in fs for flux and permeability calculation.")] = ...,
-    sym: Annotated[bool, typer.Option("-sym", help="If set, symmetrized free energy will be calculated")] = False,
+    zmin: Atd[float, Opt("-zmin", help="Min range for DeltaZ region in Å for permeability calculation.")] = None,
+    zmax: Atd[float, Opt("-zmax", help="Max range for DeltaZ region in Å for permeability calculation.")] = None,
+    timestep: Atd[float, Opt("-timestep", help="Time step in fs for flux and permeability calculation.")] = ...,
+    sym: Atd[bool, Opt("-sym", help="If set, symmetrized free energy will be calculated")] = False,
     h5: Atd[str, Opt("-h5", help="The h5 file if order.txt are stored in an h5 file. Requires the h5py package.")] = None,
     ):
     """Run Titus0 wham script."""
