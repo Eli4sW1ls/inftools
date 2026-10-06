@@ -1,12 +1,6 @@
-import tomli
-import tomli_w
 import shutil
-import subprocess
 
 import pathlib as pl
-import numpy as np
-from inftools.tistools.path_weights import get_path_weights
-from inftools.tistools.combine_results import combine_data
 
 PHRASES = [
     ["Infinit mode:", "Engaging endless loops with ∞RETIS",],
@@ -33,6 +27,7 @@ def set_default_infinit(config):
         infretis_data_i.txt file is not update in config at runtime
 
     """
+    import numpy as np
     interfaces = np.array(config["simulation"]["interfaces"])
     # set some default values first
     pL = config["infinit"].get("pL", 0.3)
@@ -64,7 +59,7 @@ def set_default_infinit(config):
     # check that interfaces are multiples of lamres
     # but skip for first iteration
     if cstep not in [-1,0]:
-        rounded_intf = np.round(np.round(interfaces/lamres)*lamres, decimals=10)
+        rounded_intf = np.round(np.floor(np.round(interfaces/lamres,decimals=10))*lamres, decimals=10)
         err_intf = np.where(rounded_intf != interfaces)[0]
         err_msg = (
             f"Interfaces {interfaces[err_intf]} are not multiples of "
@@ -92,6 +87,7 @@ def set_default_infinit(config):
     return config["infinit"]
 
 def read_toml(toml):
+    import tomli
     toml = pl.Path(toml)
     if toml.exists():
         with open(toml, "rb") as rfile:
@@ -101,14 +97,27 @@ def read_toml(toml):
         return False
 
 def write_toml(config, toml):
+    import tomli_w
     with open(toml, "wb") as wfile:
         tomli_w.dump(config, wfile)
 
+def infretisrun_internal(runfile):
+    import logging
+    import infretis.bin
+    infretis.bin.internalrun(runfile)
+    # needed to not run multiple times to same sim.log
+    # when using infretis.bin.internalrun
+    logger = logging.getLogger("main")
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+
 def run_infretis_ext(steps):
-    """Run infretis as a subprocess.
+    """Run infretis.
 
     Returns True if successful run, else False.
     """
+    import numpy as np
     c0 = read_toml("infretis.toml")
     c1 = read_toml("restart.toml")
     if c1 and c0["infinit"]["cstep"] == c1["infinit"]["cstep"] and len(c0["simulation"]["interfaces"])==len(c1["simulation"]["interfaces"]) and np.allclose(c0["simulation"]["interfaces"],c1["simulation"]["interfaces"]):
@@ -117,12 +126,12 @@ def run_infretis_ext(steps):
         # might have updated steps_per_iter
         c1["infinit"]["steps_per_iter"] = c0["infinit"]["steps_per_iter"]
         write_toml(c1, "restart.toml")
-        subprocess.run("infretisrun -i restart.toml", shell = True)
+        infretisrun_internal("restart.toml")
     else:
         print("Running with infretis.toml")
         c0["simulation"]["steps"] = steps
         write_toml(c0, "infretis.toml")
-        subprocess.run("infretisrun -i infretis.toml", shell = True)
+        infretisrun_internal("infretis.toml")
     # check if successful run
     c1 = read_toml("restart.toml")
     if not c1:
@@ -149,6 +158,9 @@ def update_toml_interfaces(config):
     the fact that we want equal local crossing probabilities betewen
     interfaces.
     """
+    from inftools.tistools.path_weights import get_path_weights
+    from inftools.tistools.combine_results import combine_data
+    import numpy as np
     config1 = read_toml("restart.toml")
     # current infinit step
     cstep = config1["infinit"]["cstep"]
@@ -157,20 +169,20 @@ def update_toml_interfaces(config):
     skip = []
     # use inft combine_data with previous combo.txt (if it exists)
     # and current infretis_data.txt file
-    if pl.Path(f"combo_{cstep-1}.toml").exists() and pl.Path(f"combo_{cstep-1}.txt").exists():
-        tomls += [f"combo_{cstep-1}.toml"]
-        datas += [f"combo_{cstep-1}.txt"]
+    if pl.Path(f"combo_{cstep}.toml").exists() and pl.Path(f"combo_{cstep}.txt").exists():
+        tomls += [f"combo_{cstep}.toml"]
+        datas += [f"combo_{cstep}.txt"]
         skip += [0]
     combine_data(
             tomls = tomls + ["restart.toml"],
             datas = datas + [config1["output"]["data_file"]],
-            out=f"combo_{cstep}",
+            out=f"combo_{cstep+1}",
             skip= skip + [int(config1["current"]["cstep"]*config1["infinit"]["skip"])],
             )
     # calculate crossing probability for interface estimation
     xp = get_path_weights(
-        toml = f"combo_{cstep}.toml",
-        data = f"combo_{cstep}.txt",
+        toml = f"combo_{cstep+1}.toml",
+        data = f"combo_{cstep+1}.txt",
         nskip = 0,
         outP = "last_infretis_pcross.txt",
         out = "last_infretis_path_weigths.txt",
@@ -190,6 +202,21 @@ def update_toml_interfaces(config):
 
     n = config1["runner"]["workers"]
 
+    # in some cases we might not have enough data to construct a Pcross
+    # curve, resulting in p having elements that are 0
+    zero_idx = np.where(p>0)[0]
+
+    # if all elements in pcross are 0 continue with same interfaces
+    # else remove the elements that are 0 and continue as usual
+    if len(zero_idx) == 0 or zero_idx[-1] == 0:
+        print("*** Could not construct Pcross curve, all elements are 0.")
+        print("*** Continuing with the same interfaces")
+        config["infinit"]["prev_Pcross"] = 0.0
+        return
+
+    p = p[:zero_idx[-1] + 1]
+    x = x[:zero_idx[-1] + 1]
+
     Ptot = p[-1]
     num_ens = config["infinit"].get("num_ens", False)
     if num_ens:
@@ -201,7 +228,12 @@ def update_toml_interfaces(config):
     intf = list(interfaces) + config["simulation"]["interfaces"][-1:]
     # round interfaces to lambda resolution, and avoid precision errors
     lamres = config["infinit"]["lamres"]
-    intf_tmp = np.round(np.round(np.array(intf[1:-1])/lamres)*lamres, decimals=10)
+    # avoid rounding errors in last ensembles causing maxop path to be non-valid
+    if intf[-2] + lamres >= x[-1]:
+        intf[-2] = x[-1] - lamres
+    # always round new interfaces *down* so we  don't accidentally round the
+    # second-to-last interface above the highest maxop of the highest path
+    intf_tmp = np.round(np.floor(np.round(np.array(intf[1:-1])/lamres,decimals=10))*lamres, decimals=10)
     # remove duplicates if any appear due to rounding of interfaces
     intf_tmp = list(np.unique(intf_tmp))
     # if we suddenly have less workers than interfaces, just return the
@@ -212,25 +244,28 @@ def update_toml_interfaces(config):
     elif len(intf_tmp) < len(intf)-2:
         print(f"* Rounding interfaces to lamres, there are now {len(intf_tmp)+1} plus ensembles, and not {num_ens}")
 
+    # if some of the interfaces land on lambda A or B, try to shift them with lamres
+    # or remove the interface if even that results in duplicates
+    if intf[0] in intf_tmp:
+        idx = intf_tmp.index(intf[0])
+        if intf_tmp[idx] + lamres not in intf_tmp:
+            intf_tmp[idx] = intf_tmp[idx] + lamres
+            print("* Shifting intfs[1] because it would land on intf A")
+        else:
+            print("* Removing an interface because it landed on intf A")
+            intf_tmp.pop(idx)
+
+    if intf[-1] in intf_tmp:
+        idx = intf_tmp.index(intf[-1])
+        if intf_tmp[idx] - lamres not in intf_tmp:
+            intf_tmp[idx] = intf_tmp[idx] - lamres
+            print("* Shifting intfs[-2] because it would land on intf B")
+        else:
+            print("* Removing an interface because it landed on intf B")
+            intf_tmp.pop(idx)
+
     config["simulation"]["interfaces"] =intf[:1] +  intf_tmp + intf[-1:]
     config["simulation"]["shooting_moves"] = sh_moves = ["sh", "sh"] + ["wf" for i in range(len(intf)-2)]
-
-def update_folders():
-    config = read_toml("infretis.toml")
-    old_dir = pl.Path(config["simulation"]["load_dir"])
-    new_dir = pl.Path(f"run{config['infinit']['cstep']}")
-    if new_dir.exists():
-        msg = (f"{str(new_dir)} allready exists! Infinit does not "
-                + "overwrite.")
-        print(msg)
-        if not old_dir.exists():
-            print("Did not find {old_dir}.")
-            return False
-
-        return True
-
-    shutil.move(old_dir, new_dir)
-    return False
 
 def update_toml(config):
     config0 = read_toml("infretis.toml")
@@ -240,9 +275,58 @@ def update_toml(config):
     shutil.copyfile("infretis.toml", f"infretis_{config['infinit']['cstep']}.toml")
     write_toml(config0, "infretis.toml")
 
+def rename_file(old_file, new_file):
+    old_file = pl.Path(old_file)
+    new_file = pl.Path(new_file)
+    old_file.rename(new_file)
+
+def update_actives_toml(out):
+    config0 = read_toml("infretis.toml")
+    config1 = read_toml("restart.toml")
+    config0["current"] = config1["current"]
+    # remove/change some entries in the 'current' section
+    config0["current"]["frac"] = {}
+    config0["current"]["cstep"] = 0
+    if "restarted_from" in config0["current"].keys():
+        config0["current"].pop("restarted_from")
+    traj_num = config0["current"]["traj_num"]
+    # rename active paths for next round. They are not sorted wrt.
+    # ensembles so well do this here
+    active = [-1 for i in out.values()]
+    for i, path_old in out.items():
+        new_path_nr = traj_num + i
+        active[i] = new_path_nr
+        path_new = path_old.parent/f"{new_path_nr}"
+        path_new.symlink_to(path_old.resolve(), target_is_directory=True)
+    # traj_num should be 1 larger than largest path nr
+    config0["current"]["traj_num"] = max(active) + 1
+    # update active path list from the path numbers picked with new interfaces
+    config0["current"]["active"] = active
+    config0["current"]["size"] = len(active)
+    # new data file to be written is added to the infretis.toml
+    data_file = pl.Path(f"infretis_data_{config0['infinit']['cstep']+1}.txt")
+    config0["output"]["data_file"] = str(data_file)
+
+    # avoid overwriting any data files when running infretis with a 'data_file'
+    # given, so we rename any existing infretis_data.txt files here
+    if data_file.exists():
+        for i in range(1000):
+            new_data_file = data_file.parent / (data_file.name + f".{i}")
+            if not new_data_file.exists():
+                data_file.rename(new_data_file)
+                print(f"* File renamed from {data_file} to {new_data_file}")
+                break
+
+    # add interface column to infretis_data file
+    with open(config0["output"]["data_file"], "a") as wfile:
+        line = "#intf: " + ",".join(str(i) for i in config0["simulation"]["interfaces"]) + "\n"
+        wfile.write(line)
+    write_toml(config0, "infretis.toml")
+
 def print_logo(step: int = 0):
     from rich.console import Console
     from rich.text import Text
+    import numpy as np
 
     console = Console()
     art = Text()
@@ -287,6 +371,7 @@ def estimate_interface_positions(x, p, pL=0.3, num_ens=False):
         the actual pL separation between interfaces
 
     """
+    import numpy as np
     # estimate how many interfaces we need
     if not num_ens:
         num_ens = int(np.log(p[-1])/np.log(pL))

@@ -86,13 +86,14 @@ def shoot(
     path = Path()
     shooting_point = System()
     shooting_point.config = (conf, index)
+    engine.dump_phasepoint(shooting_point)
     # calculate order, this defines the starting conditions
     # if op < intf[0] we assume [0-] path
     # if op >= intf[0] and op < intf[-1] we assume [N+] path
     # if op >= intf[-1] what should we do?
     # modify velocities, which dumps the shooting point to genvel.ext
-    engine.modify_velocities(shooting_point, config["simulation"]["tis_set"])
     # now calculate orderp after vel generation, as order may depend on vels
+    engine.modify_velocities(shooting_point, config["simulation"]["tis_set"])
     order = engine.calculate_order(shooting_point)
     shooting_point.order = order
     print(f"* Initial orderparameter value: {order}")
@@ -106,7 +107,7 @@ def shoot(
             start_cond = ("R")
     elif order[0] >= intf[0]:
         ens_intf = (intf[0],intf[0],intf[-1])
-        start_cond = ("L")
+        start_cond = ("L","R")
     else:
         exit(f"[ERROR] order value >= interface[-1] ({intf[-1]})!"
         " Not sure what you want to do here.")
@@ -120,7 +121,9 @@ def shoot(
             "rgen": engine.rgen,
             }
     success, out_path, status = shoot(ens_set, path, engine, shooting_point, start_cond)
+    out_path.status = "ACC"
     out_path.path_number = 0
     pstore = PathStorage()
     pstore.keep_traj_fnames = config.get("output",{}).get("keep_traj_fnames",[])
-    pstore.output(0, {"path": out_path, "dir": wdir})
+    pstore.output(0, {"path": out_path, "dir": wdir, "status": "ACC"})
+    return out_path

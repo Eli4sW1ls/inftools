@@ -2,8 +2,6 @@ import os
 from typing import Annotated
 
 import typer
-
-from inftools.exercises.puckering import initial_path_from_iretis
 from inftools.misc.infinit_helper import *
 
 # export _TYPER_STANDARD_TRACEBACK=1
@@ -29,17 +27,21 @@ def generate_zero_paths(
     from infretis.classes.system import System
     from infretis.setup import setup_config
 
+
+    config0 = read_toml(toml)
+
     # make a directory we work from
-    tmp_dir = pl.Path("temporary_load/")
-    tmp_dir.mkdir(exist_ok = False)
-    load_dir = pl.Path("load/")
+    if config0["engine"]["class"] == "ase_external":
+        tmp_dir = pl.Path("worker0")
+        tmp_dir.mkdir(exist_ok = True)
+    else:
+        tmp_dir = pl.Path("worker0")
+        tmp_dir.mkdir(exist_ok = False)
+    load_dir = pl.Path(config0["simulation"].get("load_dir", "load"))
     load_dir.mkdir(exist_ok = False)
 
     initial_configuration = conf
 
-    # maximal length of initial paths
-
-    config0 = read_toml(toml)
     config0["runner"]["workers"] = 1
     write_toml(config0, "zero_paths.toml")
     # infretis parameters
@@ -57,13 +59,15 @@ def generate_zero_paths(
     engine_key = list(state.engines.keys())[0]
     engine = state.engines[engine_key][0]
     engine.exe_dir = str(tmp_dir.resolve())
+    wmdrun = False
     if "dask" in config.keys():
         wmdrun = config["dask"]["wmdrun"][0]
-    else:
+    elif "wmdrun" in config["runner"].keys():
         wmdrun = config["runner"]["wmdrun"][0]
-    engine.set_mdrun(
-        {"wmdrun": wmdrun, "exe_dir": engine.exe_dir}
-    )
+    if wmdrun:
+        engine.set_mdrun(
+            {"wmdrun": wmdrun, "exe_dir": engine.exe_dir}
+        )
     system0.set_pos((os.path.abspath(initial_configuration), 0))
     system0.order = engine.calculate_order(system0)
     engine.rgen = np.random.default_rng()
@@ -119,7 +123,7 @@ def generate_zero_paths(
         path1r, state.ensembles[1], path1.phasepoints[0], reverse=True
     )
 
-    print("Done! Making load/ dir")
+    print(f"Done! Making {load_dir} dir")
     # make load directories
     pathsf = [path0, path1]
     pathsr = [path0r, path1r]
@@ -157,8 +161,9 @@ def generate_zero_paths(
         for trajfile in np.unique(
             [pp.config[0].split("/")[-1] for pp in path.phasepoints]
         ):
-            traj_path = tmp_dir / trajfile
-            traj_path.rename(accepted / trajfile)
+            src_path = tmp_dir / trajfile
+            dest_path = accepted / trajfile
+            shutil.move(src_path, dest_path)
     return max_op
 
 
@@ -167,6 +172,9 @@ def infinit(
     log: Annotated[str, typer.Option("-log", help="File for logging output")] = "infretis_init.log",
     ):
     """The infretis initial path generator."""
+
+    from inftools.exercises.puckering import initial_path_from_iretis
+
     # Based on the YouTube series:
     # https://www.youtube.com/watch?v=mW9tC2A7COs&list=PL5dSi5eZMe1iN_Uz8pTph6i8AGXhVUZIj&index=24
 
@@ -212,7 +220,7 @@ def infinit(
         sh_moves = ["sh", "sh"] + ["wf" for i in range(len(intf)-2)]
 
         # create symlink to load/1 path Nworker-1 times
-        load_dir = pl.Path("load")
+        load_dir = pl.Path(config["simulation"].get("load_dir", "load"))
         load0 = load_dir / "1"
         for i in range(1,nworkers):
             loadn = load_dir / str(i + 1)
@@ -229,6 +237,7 @@ def infinit(
     if not pl.Path("infretis.toml").exists():
         print("Writing infretis.toml")
         c0 = read_toml(toml)
+        c0["infinit"] = iset
         write_toml(c0, "infretis.toml")
     print_logo(step = -1)
     for iretis_steps in iset["steps_per_iter"][iset["cstep"]:]:
@@ -238,17 +247,19 @@ def infinit(
             print(f" *** infinit exiting loop at cstep={iset['cstep']}")
             return 1
         log.log("Updating interfaces.")
-        # print(config)
         update_toml_interfaces(config)
         msg = "interfaces = ["
         msg += ", ".join([str(intf) for intf in config["simulation"]["interfaces"]])
         msg += "]"
         log.log(msg)
-        log.log("Moving and writing files.")
-        has_load = update_folders()
         iset["cstep"] += 1
         update_toml(config)
-        if not has_load:
-            initial_path_from_iretis("run*", "infretis.toml", restart = "restart.toml", active_path_dir=f"run{iset['cstep']-1}")
-        else:
-            print("Doesnt have load?")
+        out = initial_path_from_iretis(
+                config["simulation"].get("load_dir", "load"),
+                "infretis.toml",
+                restart = "restart.toml",
+                return_pathnr = True)
+        # update infretis.toml to be a restart.toml
+        update_actives_toml(out)
+        # rename restart file
+        rename_file("restart.toml", f"restart_{iset['cstep']}.toml")

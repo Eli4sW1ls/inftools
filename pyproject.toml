@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "inftools"
-version = "0.1.0"
-description = "Useful tools for AIRETIS simulations"
+version = "2026.1.1"
+description = "Useful tools for infRETIS simulations"
 authors = [
     "Daniel Zhang <daniel.t.zhang@ntnu.no>",
     "Lukas Baldauf <lukas.baldauf@ntnu.no>",
@@ -11,15 +11,13 @@ authors = [
 license = "MIT"
 readme = "README.md"
 
+homepage = "https://github.com/infretis/inftools"
+repository = "https://github.com/infretis/inftools"
+keywords = ["simulation", "retis", "molecular-dynamics", "path-sampling"]
+
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
-numpy = "^1.26.0"
-matplotlib = "^3.7.2"
-tomli = "^2.0.1"
-tomli-w = "^1.0.0"
-typer = "^0.12.3"
-mdanalysis = "^2.7.0"
-infretis = "^2025.4"
+typer = "^0.19"
 
 [tool.poetry.scripts]
 inft = "inftools.bin:app"

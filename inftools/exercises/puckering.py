@@ -12,17 +12,15 @@ import subprocess
 from types import SimpleNamespace
 import pathlib
 
-import numpy as np
-import tomli
-import tomli_w
-from infretis.classes.orderparameter import Puckering
-
 
 def check_indices(
         sdf: Annotated[str, typer.Option("-sdf", help="The .sdf file of your molecule (e.g. mol.sdf)")],
         idx: Annotated[Tuple[int, int, int, int, int, int], typer.Option("-idx", help="The ordered indices of your molecule (e.g. 2 5 11 8 1 0)")],
     ):
     """Calculate the theta and phi angle for an .sdf file given a set of indices."""
+
+    from infretis.classes.orderparameter import Puckering
+    import numpy as np
 
     orderparameter = Puckering(index=idx)
 
@@ -48,6 +46,8 @@ def concatenate(
     import MDAnalysis as mda
     from MDAnalysis.analysis.align import alignto
     from MDAnalysis.lib.mdamath import make_whole
+    import numpy as np
+
 
     # parser.add_argument(
     #     "--selection",
@@ -146,6 +146,7 @@ def initial_path_from_iretis(
     out_toml: Annotated[str, typer.Option("-out_toml", help="Output file if interfaces and shooting_moves are chagned")] = "",
     keep_all_active: Annotated[bool, typer.Option(help = "If active paths are no longer valid, add new interfaces")] = False,
     active_path_dir: Annotated[str, typer.Option(help = "Directory to the active paths ('-traj' if not given)")] = "",
+    return_pathnr: Annotated[bool, typer.Option(help = "Only return the path numbers for each ensemble")] = False,
     ):
     """Pick out initial paths from an earlier infretis simulation.
 
@@ -170,6 +171,10 @@ def initial_path_from_iretis(
         * Check that selected paths are actually valid wf paths using infretis
         functions
     """
+    import tomli
+    import tomli_w
+    import numpy as np
+
     out_dir = pathlib.Path(out_dir)
     toml = pathlib.Path(toml)
     if not active_path_dir:
@@ -181,13 +186,14 @@ def initial_path_from_iretis(
     if out_toml:
         out_toml = pathlib.Path(out_toml)
 
-    if out_dir.exists():
-        raise ValueError(
-            f"Directory {out_dir.resolve()} exists. Will not overwrite. "
-            "Rename or delete it manually. Aborting."
-        )
-    else:
-        os.mkdir(out_dir)
+    if not return_pathnr:
+        if out_dir.exists():
+            raise ValueError(
+                f"Directory {out_dir.resolve()} exists. Will not overwrite. "
+                "Rename or delete it manually. Aborting."
+            )
+        else:
+            os.mkdir(out_dir)
 
     # read interfaces from .toml file
     with open(toml, "rb") as toml_file:
@@ -356,11 +362,13 @@ def initial_path_from_iretis(
         ), f"* Did not find any paths in ensemble {i}\
     that cross the corresponding interface"
 
+    if not return_pathnr:
+        for i, traj in zip(out.keys(), out.values()):
+            shutil.copytree(traj, out_dir / str(i))
 
-    for i, traj in zip(out.keys(), out.values()):
-        shutil.copytree(traj, out_dir / str(i))
-
-    print(f"\nAll done! Created folder {out_dir} with new initial paths.")
+        print(f"\nAll done! Created folder {out_dir} with new initial paths.")
+    else:
+        return out
 
 def initial_path_from_md(
         trr: Annotated[str, typer.Option("-trr", help="The .trr trajectory file")],
@@ -368,6 +376,9 @@ def initial_path_from_md(
         order: Annotated[str, typer.Option("-order", help="The order file corresponding to the trajectory")],
         ):
     "Generate initial paths for an infretis simulation from an equilibrium run."
+    import tomli
+    import numpy as np
+
 
     predir = "load"
     if os.path.exists(predir):
@@ -496,7 +507,10 @@ def plot_order(
         skip: Annotated[bool, typer.Option("-skip" , help="skip initial load paths")] = False,
     ):
     "Plot the order parameter of all paths from an infretis simulation."
+    import tomli
     import matplotlib.pyplot as plt
+    import numpy as np
+
     # read interfaces from the .toml file
     with open(toml, "rb") as toml_file:
         toml_dict = tomli.load(toml_file)
@@ -524,22 +538,37 @@ def plot_order(
     # plot all paths, modify by your needs
     if skip:
         sorted_paths = sorted_paths[len(interfaces):]
+    react_x, react_y = [], []
+    ureact_x, ureact_y = [], []
     for path in sorted_paths:
         x = np.loadtxt(path)
         if x.shape[1] > 2:
-           if x[-1, 1] > interfaces[-1]:
+            if x[-1, 1] > interfaces[-1]:
                 print(
                     f"The path in {path} is reactive with \
         phi={x[-1,2]:.2f}! \U0001F389 \U0001F938 \U0001F483"
                 )
-           #    continue # continues to next iteration in loop
-        a.plot(
-            x[:, xy[0]],
-            x[:, xy[1]],
-            c="C0",
-            marker="o",
-            markersize=2.5,
-            lw=lw,
-        )
+                #    continue # continues to next iteration in loop
+                react_x += list(x[:, xy[0]]) + [None]
+                react_y += list(x[:, xy[1]]) + [None]
+                continue
+        ureact_x += list(x[:, xy[0]]) + [None]
+        ureact_y += list(x[:, xy[1]]) + [None]
+    a.plot(
+        react_x,
+        react_y,
+        c="C1",
+        marker="o",
+        markersize=2.5,
+        lw=lw,
+    )
+    a.plot(
+        ureact_x,
+        ureact_y,
+        c="C0",
+        marker="o",
+        markersize=2.5,
+        lw=lw,
+    )
 
     plt.show()

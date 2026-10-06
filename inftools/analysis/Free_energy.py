@@ -58,10 +58,22 @@ def calculate_free_energy(trajlabels, WFtot, Trajdir, outfolder, histo_stuff, lm
     dx = (Maxx - Minx) / Nbinsx
     xval = [Minx + 0.5 * dx + i * dx for i in range(Nbinsx)]
 
-    for label, factor in zip(trajlabels, WFtot):
-        trajfile = Trajdir + "/" + str(label) + "/order.txt"
-        data = extract(trajfile, xcol, ycol)
-        histogram = update_histogram(data, factor, histogram, Minx, Maxx, Miny, dx, dy)
+    h5file = histo_stuff.get("h5")
+    if h5file is not None and os.path.exists(h5file):
+        import h5py
+        with h5py.File(h5file, "r") as h5f:
+            for label, factor in zip(trajlabels, WFtot):
+                data = h5f[f"{label}/order.txt"]
+                if ycol is not None:
+                    data = data[1:-1,[xcol,ycol]].T
+                else:
+                    data = data[1:-1, xcol]
+                histogram = update_histogram(data, factor, histogram, Minx, Miny, dx, dy)
+    else:
+        for label, factor in zip(trajlabels, WFtot):
+            trajfile = Trajdir + "/" + str(label) + "/order.txt"
+            data = extract(trajfile, xcol, ycol)
+            histogram = update_histogram(data, factor, histogram, Minx, Maxx, Miny, dx, dy)
 
     index_lA = None
     if xi is not None:
