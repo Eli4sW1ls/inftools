@@ -143,3 +143,4 @@ tags
 test/simdata_dw/
 inftools/*.png
 *.npy
+examples/staple_test/q_cv_discrepancy*/
