@@ -1,24 +1,98 @@
 #!/usr/bin/env python3
 """
-tistools-running-error-staple-opt: Optimized running estimate error analysis for APPTIS (STAPLE).
+error_analysis_staple: running estimate + recursive block error analysis for
+iSTAR/StapleTIS simulations run with infretis.
 
-Computes running estimates at regular intervals using vectorized recursive formulas.
-Outputs:
-  - Running estimates of P_cross, Q matrix elements, and P (MSM) matrix elements.
-  - Highly optimized block error analysis (numpy reshape, no Python per-element loops).
+Reads `infretis_data.txt` + `infretis.toml` (same front end as
+`tistools/scripts/infretis_memory_analysis.py`), computes running estimates
+of P_cross, the Q and P (MSM) matrices (and optionally flux/MFPT/rate) every
+`interval` paths, and performs vectorized recursive block error analysis on them.
+
+Outputs (in --outdir, default <simdir>):
+  - pcross_runav.txt, qmat_runav.txt, pmat_runav.txt, rate_runav.txt
+  - {pcross,qmat,pmat,rate}_block_errors_<interval>.{txt,png}
 
 Usage:
-    python tistools-running-error-staple-opt.py <simulation_dir> [options]
+    inft error_analysis_staple <simulation_dir> [options]
+
+Example:
+    inft error_analysis_staple /path/to/infretis_sim --interval 100 --nskip 1000
 """
 
-import argparse
+import contextlib
+import io
 import sys
-import os
+import time
+import warnings
 from pathlib import Path
 import numpy as np
 from typing import Annotated, Dict, Optional
 
 import typer
+
+
+# =============================================================================
+# PROGRESS / OUTPUT HELPERS
+# =============================================================================
+@contextlib.contextmanager
+def quiet(enabled=True):
+    """Silence the very chatty weight/tistools analysis routines."""
+    if not enabled:
+        yield None
+        return
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield buf
+
+
+def _fmt_time(seconds):
+    if not np.isfinite(seconds) or seconds < 0:
+        return "--"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def make_progress(cycles, stream=sys.stderr, min_dt=0.2):
+    """
+    Progress reporter for the running-estimate loop.
+
+    The cost of each step grows with the number of paths it covers (every
+    snapshot re-scans the paths from the start), so the ETA is weighted by
+    paths done / paths total rather than by step count -- a step-count ETA
+    would be wildly optimistic early on. Redraws are throttled to one per
+    `min_dt` seconds, since with small intervals there can be many thousands
+    of steps.
+    """
+    cycles = np.asarray(cycles, dtype=float)
+    work = np.cumsum(cycles)
+    total = len(cycles)
+    state = {"t0": time.time(), "last": -np.inf}
+
+    def progress(idx):
+        now = time.time()
+        final = idx + 1 == total
+        if not final and now - state["last"] < min_dt:
+            return
+        state["last"] = now
+        frac = min(work[idx] / work[-1], 1.0) if work[-1] > 0 else 1.0
+        elapsed = now - state["t0"]
+        eta = elapsed / frac - elapsed if frac > 1e-9 else float("inf")
+        width = 30
+        filled = int(width * frac)
+        bar = "#" * filled + "." * (width - filled)
+        stream.write(f"\r  [{bar}] {idx + 1:>4}/{total} steps  cycle {int(cycles[idx]):>9}  "
+                     f"elapsed {_fmt_time(elapsed):>7}  eta {_fmt_time(eta):>7}  ")
+        stream.flush()
+        if final:
+            stream.write("\n")
+            stream.flush()
+
+    return progress
 
 
 # =============================================================================
@@ -42,7 +116,10 @@ def calculate_infretis_weights(data_file: str, toml_file: str, nskip: int = 0) -
     --------
     Dict containing path data and weights
     """
-    import tomli
+    try:
+        import tomllib as tomli
+    except ImportError:
+        import tomli
     import re
     import random
     from inftools.misc.data_helper import data_reader
@@ -102,8 +179,13 @@ def calculate_infretis_weights(data_file: str, toml_file: str, nskip: int = 0) -
         print(f"read lm1 from toml: {lm1}")
 
     
-    # Load data
-    data = np.loadtxt(data_file, dtype=str, usecols=np.arange(27))
+    # infretis_data.txt has 2*n_interfaces + 5 columns (pnr, len, maxop, minop,
+    # ptype, then path_f and path_w per interface). Some rows in practice have
+    # extra trailing whitespace-separated junk, which makes a plain
+    # np.loadtxt(..., dtype=str) (no usecols) see a ragged/inconsistent column
+    # count and fail; pin usecols to the expected width to avoid that.
+    n_cols = 2 * len(interfaces) + 5
+    data = np.loadtxt(data_file, dtype=str, usecols=np.arange(n_cols))
     data = data[nskip:]  # Skip initial entries
     
     # Check if we have ptype information (look for correct patterns)
@@ -659,50 +741,38 @@ def compute_rel_errors_2d(runavfull, sizes, bestav=None):
     return rel_errors[:, 0] if flat else rel_errors
 
 
-# =============================================================================
-# CLI PARSER 
-# =============================================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Running estimate error analysis for APPTIS (STAPLE) simulations.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("simdir", type=str, help="Path to REPPTIS simulation directory")
-    parser.add_argument("--interval", "-i", type=int, default=10000, help="Interval between running estimates in cycles (default: 10000)")
-    parser.add_argument("--skip", "-s", type=int, default=0, help="Cycles to skip from beginning (default: 0)")
-    parser.add_argument("--pathlengths", action="store_true", help="Include path length information in output")
-    parser.add_argument("--load-orders", action="store_true", help="Load order parameters from .npy files")
-    parser.add_argument("--output", "-o", type=str, default=None, help="Output file for results (default: stdout)")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Only print final summary")
-    return parser.parse_args()
-
 
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 
 def error_analysis_staple(
-    simdir: Annotated[str, typer.Argument(help="Path to simulation directory")],
-    interval: Annotated[int, typer.Option("-i", "--interval", help="Interval between running estimates in cycles (default: 1)")] = 1,
-    skip: Annotated[int, typer.Option("-s", "--skip", help="Cycles to skip from beginning (default: 0)")] = 0,
-    pathlengths: Annotated[bool, typer.Option("--pathlengths", help="Include path length information in output")] = False,
-    load_orders: Annotated[bool, typer.Option("--load-orders", help="Load order parameters from .npy files")] = False,
-    output: Annotated[Optional[str], typer.Option("-o", "--output", help="Output file for results (default: stdout)")] = None,
-    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Only print final summary")] = False,
+    simdir: Annotated[str, typer.Argument(help="Path to the infretis simulation directory (containing infretis_data.txt and infretis.toml)")],
+    data_file: Annotated[Optional[str], typer.Option("--data-file", help="Path to infretis_data.txt (default: <simdir>/infretis_data.txt)")] = None,
+    toml_file: Annotated[Optional[str], typer.Option("--toml-file", help="Path to infretis.toml (default: <simdir>/infretis.toml)")] = None,
+    nskip: Annotated[int, typer.Option("--nskip", help="Number of initial path entries to skip (default: 0)")] = 0,
+    interval: Annotated[int, typer.Option("-i", "--interval", help="Interval between running estimates in paths (default: 1). Cost grows as ~n_paths^2/interval.")] = 1,
+    pathlengths: Annotated[bool, typer.Option("--pathlengths", help="Also compute running flux/MFPT/rate estimates from the path lengths")] = False,
+    outdir: Annotated[Optional[str], typer.Option("--outdir", help="Directory to save running estimates, block errors and plots in (default: <simdir>)")] = None,
+    output: Annotated[Optional[str], typer.Option("-o", "--output", help="Output file for the report (default: stdout)")] = None,
+    verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Do not suppress the (very chatty) output of the weight/tistools routines")] = False,
+    quiet_progress: Annotated[bool, typer.Option("-q", "--quiet", help="Do not show the progress bar")] = False,
 ):
-    # args = parse_args()
+    # The block-error writer saves figures; pick a non-interactive backend
+    # before tistools pulls in pyplot, or this dies on a headless machine.
+    import matplotlib
+    matplotlib.use("Agg")
 
-    # Dynamic imports for PyRETIS/tistools topology
     try:
+        # A directory containing an empty `tistools` namespace package lives
+        # under inftools; strip it so `import tistools` resolves to the real,
+        # pip-installed (editable) tistools package instead of that shadow.
         sys.path = [p for p in sys.path if 'inftools' not in p]
-        sys.path.insert(0, os.path.abspath('/mnt/0bf0c339-34bb-4500-a5fb-f3c2a863de29/DATA/APPTIS/tistools'))
         from tistools import get_transition_probs_weights, construct_M_istar, global_pcross_msm_star, write_plot_block_error, write_running_estimates
         from tistools import mfpt_to_absorbing_staple, construct_tau_matrix_staple, mfpt_to_absorbing_staple_balanced, mfpt_istar, mfpt_istar_balanced
-        # If your notebook used specific tistools extraction functions, import them here
     except ImportError as e:
-        print(f"Error: Could not import necessary tistools functions: {e}", file=sys.stderr)
+        print(f"Error: Could not import tistools: {e}", file=sys.stderr)
+        print("Make sure tistools is installed or in your PYTHONPATH.", file=sys.stderr)
         sys.exit(1)
 
     simdir = Path(simdir).resolve()
@@ -710,34 +780,52 @@ def error_analysis_staple(
         print(f"Error: Directory {simdir} does not exist", file=sys.stderr)
         sys.exit(1)
 
+    outdir = Path(outdir).resolve() if outdir else simdir
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    data_file = data_file or str(simdir / "infretis_data.txt")
+    toml_file = toml_file or str(simdir / "infretis.toml")
+    for f in (data_file, toml_file):
+        if not Path(f).exists():
+            print(f"Error: File not found: {f}", file=sys.stderr)
+            sys.exit(1)
+
     out = open(output, "w") if output else sys.stdout
 
-    def log(msg):
-        if not quiet:
-            print(msg, file=out)
+    def log(msg=""):
+        print(msg, file=out)
 
     log("=" * 80)
-    log("OPTIMIZED RUNNING ESTIMATE ERROR ANALYSIS")
+    log("RUNNING ESTIMATE + RECURSIVE BLOCK ERROR ANALYSIS (infretis STAPLE)")
     log("=" * 80)
-    log(f"Simulation: {simdir}")
-    log(f"Interval: {interval} cycles")
-    log(f"Skip from start: {skip}\n")
+    log(f"Simulation      : {simdir}")
+    log(f"Data file       : {data_file}")
+    log(f"TOML file       : {toml_file}")
+    log(f"Output dir      : {outdir}")
+    log(f"Interval        : {interval} paths")
+    log(f"Skip from start : {nskip}")
+    log()
 
-    # 1. Load Data [cite: 6]
-    # Calculate infretis weights
-    log("=== STEP 1: CALCULATING INFRETIS WEIGHTS ===")
-    weight_results = calculate_infretis_weights(simdir / "infretis_data.txt", simdir / "infretis.toml", nskip=skip)
+    # -------------------------------------------------------------------------
+    # 1. READING (infretis_data.txt + infretis.toml) + WEIGHTS
+    # -------------------------------------------------------------------------
+    print("Reading infretis data...", file=sys.stderr)
+    t_load = time.time()
+    with quiet(not verbose):
+        weight_results = calculate_infretis_weights(data_file, toml_file, nskip=nskip)
+        # Compute weight matrices, best with tr = False
+        weight_matrices_results = compute_weight_matrices_weights(weight_results, tr=False)
+    w_path = weight_matrices_results['weight_matrix_3d']
+    w_path_2d = weight_matrices_results['weight_matrix_2d']
     lm1 = weight_results.get("lm1", None)
-    log(f"lm1 value from weights: {lm1}")
-
-    log("\nWeight calculation summary:")
-    log(f"Number of interfaces: {len(weight_results['interfaces'])}")
-    log(f"Interfaces: {weight_results['interfaces']}")
-    log(f"Number of paths processed: {len(weight_results['path_data']['pnr'])}")
 
     D = weight_results['path_data']
     N_int = len(weight_results['interfaces'])
     N_paths = len(D['pnr'])
+    log(f"Interfaces      : {N_int}  {weight_results['interfaces']}")
+    log(f"lm1             : {lm1}")
+    log(f"Paths available : {N_paths} (after skip)")
+
     path_w_full = D['path_w']
     path_f_full = D['path_f']
     is_ens0_full = (np.minimum(path_w_full, 1.0) != 0) & (path_f_full != 0)
@@ -752,29 +840,37 @@ def error_analysis_staple(
         tau2_full    = D["tau2"]
         taum_full    = D["taum"]
     
-    # Compute weight matrices, best with tr = False
-    log("\n=== STEP 2: COMPUTING WEIGHT MATRICES ===")
-    weight_matrices_results = compute_weight_matrices_weights(weight_results, tr=False)
-    w_path = weight_matrices_results['weight_matrix_3d']
-    w_path_2d = weight_matrices_results['weight_matrix_2d']
-    log("Weight matrices computed successfully!")
-    
     # Define our snapshots based on interval
     start_cyc = max(10, interval)
     nskip_arr = np.arange(start_cyc, N_paths, interval, dtype=np.intp)
     n_snapshots = len(nskip_arr)
+    if n_snapshots == 0:
+        print(f"Error: only {N_paths} paths after skip; need more than {start_cyc} "
+              f"for a single running estimate.", file=sys.stderr)
+        sys.exit(1)
 
-    # Output storage
-    # P_cross storage (just final interface or all L interfaces)
-    ploc_MSM_stored = np.full((n_snapshots, N_int), np.nan)
-    
-    # Store flattened Q (p_mat) and P (M_mat) matrices
     # Q matrix is N_int x N_int. P matrix varies but we evaluate at n_int=N_int
     q_mat_stored = np.full((n_snapshots, N_int, N_int), np.nan)
     p_mat_stored = np.full((n_snapshots, N_int, N_int), np.nan)
 
-    log(f"Computing running averages: {start_cyc} → {N_paths} (step {interval})")
-    log(f"Total snapshots: {n_snapshots}  |  Interfaces: {N_int}")
+    log(f"Running estimates: {n_snapshots} steps, {start_cyc} -> {N_paths} (step {interval})")
+
+    # compute_rel_errors_2d sweeps block lengths up to n_estimates // 5, so
+    # fewer than 5 estimates leaves nothing to analyse and fewer than ~25
+    # leaves too few block lengths to show a plateau.
+    if n_snapshots < 5:
+        log()
+        log(f"!! {n_snapshots} running estimates is below the minimum of 5 blocks: only the")
+        log(f"!! running estimates will be written, NO block-error output. Use")
+        log(f"!! --interval {max(N_paths // 25, 1)} or smaller.")
+        print(f"WARNING: only {n_snapshots} estimates; no block-error output will be produced. "
+              f"Try --interval {max(N_paths // 25, 1)}.", file=sys.stderr)
+    elif n_snapshots < 25:
+        log(f"  (note: only {n_snapshots} estimates; block lengths sweep to {n_snapshots // 5}, "
+            f"which may be too few to show a plateau)")
+    log()
+    print(f"  loaded in {_fmt_time(time.time() - t_load)}; "
+          f"{n_snapshots} running-estimate steps to go", file=sys.stderr)
     
     # ── 2. Global norm_factor (unchanged across all subsets) ────
     path_w_c     = np.minimum(path_w_full, 1.0)
@@ -967,47 +1063,45 @@ def error_analysis_staple(
         
         return plocs_out, p_mat, q_mat, (flux, flux_nb, mfpt_AB, mfpt_nb_AB, rate, rate_nb)
 
+
     # -------------------------------------------------------------------------
     # 2. RUNNING AVERAGE LOOP
     # -------------------------------------------------------------------------
-    checkpoint_every = 100
-    checkpoint_path = simdir / "ploc_MSM_stored.npy"
-    
     ploc_MSM_stored = np.full((n_snapshots, N_int), np.nan)
     rate_stored = np.full((n_snapshots, 6), np.nan)
     cycles = []
-    
-    for snap_i, n_rows in enumerate(nskip_arr):        
-        ploc_MSM_stored[snap_i, :], p_mat_stored[snap_i, :, :], q_mat_stored[snap_i, :, :], rate_stored[snap_i, :] = _all_plocs_and_rates_from_prefix(int(n_rows))
-        
-        # if snap_i % checkpoint_every == 0 or snap_i == n_snapshots - 1:
-        #     np.save(checkpoint_path, ploc_MSM_stored)
-        #     if snap_i % 500 == 0:
-        #         vals = ploc_MSM_stored[snap_i]
-        #         print(f"  snap {snap_i:4d}/{n_snapshots}  "
-        #                 f"nskip={n_rows:6d}  plocs={np.array2string(vals, precision=4)}")
-        #         print(f"                                rate={rate_stored[snap_i, 4]:.6e}")
-        cycles.append(n_rows)
-            
-    write_running_estimates(simdir / "pcross_runav.txt", cycles, ploc_MSM_stored, "Pcross")
-    write_running_estimates(simdir / "qmat_runav.txt", cycles, q_mat_stored.reshape(n_snapshots, -1), "Qmat")
-    write_running_estimates(simdir / "pmat_runav.txt", cycles, p_mat_stored.reshape(n_snapshots, -1), "Pmat")
-    write_running_estimates(simdir / "rate_runav.txt", cycles, rate_stored[:, 0], "Flux", rate_stored[:, 1], "Flux_nb", rate_stored[:, 2], "MFPT_AB", rate_stored[:, 3], "MFPT_nb_AB", rate_stored[:, 4], "Rate", rate_stored[:, 5], "Rate_nb")
-    print(f"✓ Done. ploc Shape: {ploc_MSM_stored.shape}")
+
+    progress = None if quiet_progress else make_progress(nskip_arr)
+
+    t0 = time.time()
+    with quiet(not verbose):
+        for snap_i, n_rows in enumerate(nskip_arr):
+            ploc_MSM_stored[snap_i, :], p_mat_stored[snap_i, :, :], q_mat_stored[snap_i, :, :], rate_stored[snap_i, :] = _all_plocs_and_rates_from_prefix(int(n_rows))
+            cycles.append(n_rows)
+            if progress is not None:
+                progress(snap_i)
+    log(f"Running estimates completed in {_fmt_time(time.time() - t0)}.")
+
+    runav_files = {
+        "pcross_runav.txt": (ploc_MSM_stored, "Pcross"),
+        "qmat_runav.txt": (q_mat_stored.reshape(n_snapshots, -1), "Qmat"),
+        "pmat_runav.txt": (p_mat_stored.reshape(n_snapshots, -1), "Pmat"),
+    }
+    # write_running_estimates dumps every array to stdout as a debug print
+    with quiet(not verbose):
+        for fname, (data, label) in runav_files.items():
+            write_running_estimates(outdir / fname, cycles, data, label)
+        write_running_estimates(outdir / "rate_runav.txt", cycles, rate_stored[:, 0], "Flux", rate_stored[:, 1], "Flux_nb", rate_stored[:, 2], "MFPT_AB", rate_stored[:, 3], "MFPT_nb_AB", rate_stored[:, 4], "Rate", rate_stored[:, 5], "Rate_nb")
+    written = list(runav_files) + ["rate_runav.txt"]
 
     # -------------------------------------------------------------------------
     # 3. VECTORIZED BLOCK ERROR ANALYSIS
     # -------------------------------------------------------------------------
-    log("\n" + "=" * 80)
-    log("COMPUTING BLOCK ERRORS")
-    log("=" * 80)
-
     # Trim nans if any
     valid_rows = ~np.any(np.isnan(ploc_MSM_stored), axis=1)
     
     # We skip early transients (e.g., first 5) for stable error bounds
     trim_start = min(5, len(valid_rows) // 1000)
-    log(f"Using {len(valid_rows) - trim_start} valid snapshots for error analysis (skipping first {trim_start} for stability)")    
     
     runav_pcross = ploc_MSM_stored[valid_rows][trim_start:]
     runav_qmat   = q_mat_stored[valid_rows][trim_start:]
@@ -1017,46 +1111,49 @@ def error_analysis_staple(
     maxbll = len(runav_pcross) // 5
     sizes  = np.arange(1, maxbll + 1, dtype=np.intp)
 
-    # Compute errors for P_cross (all L interfaces at once)
-    log(f"-> Computing P_cross errors...")
-    err_pcross = compute_rel_errors_2d(runav_pcross, sizes)
-    print(f"output file: {simdir / f'pcross_block_errors_{interval}'}")
-    write_plot_block_error(str(simdir / f"pcross_block_errors_{interval}"), runav_pcross, err_pcross, interval)
-    
-    # Compute errors for Q matrix (all N_int x N_int elements at once)
-    log(f"-> Computing Q matrix errors (shape: {N_int}x{N_int})...")
-    err_qmat = compute_rel_errors_2d(runav_qmat.reshape(len(runav_qmat), -1), sizes)
-    write_plot_block_error(str(simdir / f"qmat_block_errors_{interval}"), runav_qmat.reshape(len(runav_qmat), -1), err_qmat, interval)
-    
-    # Compute errors for P matrix (MSM)
-    log(f"-> Computing P (MSM) matrix errors (shape: {N_int}x{N_int})...")
-    err_pmat = compute_rel_errors_2d(runav_pmat.reshape(len(runav_pmat), -1), sizes)
-    write_plot_block_error(str(simdir / f"pmat_block_errors_{interval}"), runav_pmat.reshape(len(runav_pmat), -1), err_pmat, interval)
-    
-    # Compute errors for rates (flux, MFPT, etc.)
-    if pathlengths:
-        log(f"-> Computing rate errors...")
-        err_rate = compute_rel_errors_2d(runav_rate, sizes)
-        write_plot_block_error(str(simdir / f"rate_block_errors_{interval}"), runav_rate, err_rate, interval)
-    else:
-        err_rate = np.full((len(sizes), 6), np.nan)
+    if maxbll >= 1:
+        print("Computing block errors...", file=sys.stderr)
+        t_block = time.time()
+        log()
+        log(f"Using {len(valid_rows) - trim_start} valid snapshots for error analysis (skipping first {trim_start} for stability)")
 
-    # -------------------------------------------------------------------------
-    # 4. SUMMARY OUTPUT
-    # -------------------------------------------------------------------------
-    plateau_mask = sizes > maxbll // 2
-    
-    # P_cross final interface analysis
-    best_pcross = runav_pcross[-1, -1]
-    rel_err_pcross = err_pcross[:, -1]
-    half_av_err = rel_err_pcross[plateau_mask].mean() if plateau_mask.any() else rel_err_pcross[-1]
-    Nstat_ineff = (half_av_err / rel_err_pcross[0])**2 if rel_err_pcross[0] != 0 else 0.0
+        block_sets = [
+            ("pcross", runav_pcross),
+            ("qmat", runav_qmat.reshape(len(runav_qmat), -1)),
+            ("pmat", runav_pmat.reshape(len(runav_pmat), -1)),
+        ]
+        if pathlengths:
+            block_sets.append(("rate", runav_rate))
 
-    # Q / P Matrix average errors across all non-zero elements
-    avg_qmat_err = np.nanmean(err_qmat[-1, :]) 
-    avg_pmat_err = np.nanmean(err_pmat[-1, :])
+        errs = {}
+        with quiet(not verbose):
+            for name, runav in block_sets:
+                errs[name] = compute_rel_errors_2d(runav, sizes)
+                write_plot_block_error(str(outdir / f"{name}_block_errors_{interval}"), runav, errs[name], interval)
+                written.append(f"{name}_block_errors_{interval}.txt / .png")
+        print(f"  block errors done in {_fmt_time(time.time() - t_block)}", file=sys.stderr)
 
-    summary = f"""
+        err_pcross = errs["pcross"]
+        err_qmat = errs["qmat"]
+        err_pmat = errs["pmat"]
+        err_rate = errs.get("rate", np.full((len(sizes), 6), np.nan))
+
+        # ---------------------------------------------------------------------
+        # 4. SUMMARY OUTPUT
+        # ---------------------------------------------------------------------
+        plateau_mask = sizes > maxbll // 2
+        
+        # P_cross final interface analysis
+        best_pcross = runav_pcross[-1, -1]
+        rel_err_pcross = err_pcross[:, -1]
+        half_av_err = rel_err_pcross[plateau_mask].mean() if plateau_mask.any() else rel_err_pcross[-1]
+        Nstat_ineff = (half_av_err / rel_err_pcross[0])**2 if rel_err_pcross[0] != 0 else 0.0
+
+        # Q / P Matrix average errors across all non-zero elements
+        avg_qmat_err = np.nanmean(err_qmat[-1, :]) 
+        avg_pmat_err = np.nanmean(err_pmat[-1, :])
+
+        summary = f"""
     Block Error Summary:
     ---------------------------------------------------
     Data points analyzed          : {len(runav_pcross)}
@@ -1071,15 +1168,23 @@ def error_analysis_staple(
     
     Rate Average Rel Error           : {np.nanmean(err_rate[-1, :]) if pathlengths else 'N/A'}
     """
-    
-    # Only print standard output if not quiet, but always print summary
-    if out != sys.stdout:
-        print(summary)
-    log(summary)
+        log(summary)
+        # The report went to a file: still show the summary on the terminal.
+        if output:
+            print(summary)
+    else:
+        log()
+        log(f"!! Only {len(runav_pcross)} valid running estimates: skipping block error analysis.")
+
+    log(f"Written to {outdir}:")
+    for fname in written:
+        log(f"  {fname}")
+    log()
+    log("Read the relative error against block length and take the plateau: short")
+    log("blocks are still correlated and underestimate the error, while very long")
+    log("blocks leave too few of them for the standard error to be meaningful.")
+    log("=" * 80)
 
     if output:
         out.close()
-        print(f"Results written to {output}")
-
-# if __name__ == "__main__":
-#     main()
+        print(f"Report written to {output}", file=sys.stderr)
