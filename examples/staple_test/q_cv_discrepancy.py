@@ -26,7 +26,10 @@ This script
                                 frac_explained = (q_pred_G - q_ref) / (q_obs_G - q_ref)
      plus a permutation test of whether each group's q differs from the pool at
      all, and a per-path table (CV percentile within the reference group) for the
-     small groups.
+     small groups,
+  5. bins all frames of every path by lambda and shows, per group (and split by
+     outcome), the path-averaged CV per lambda bin and the 2D histogram
+     P(CV | lambda) (--profile-until-cross: only frames up to the conditioning point).
 
 Usage:
     python q_cv_discrepancy.py --data-dir <infstapletis dir> [--k 12]
@@ -279,6 +282,93 @@ def bootstrap_q(y, w, n_boot, rng):
 
 
 # --------------------------------------------------------------------------- #
+# CVs as a function of lambda over the full paths
+# --------------------------------------------------------------------------- #
+def profile_bin_edges(feat, orders, lambda_bin, ncvb=40):
+    """lambda bins of width lambda_bin and per-CV bins, from a subsample of all frames."""
+    sample = np.concatenate([orders[p][::10] for p in feat["pnr"].values])
+    # full lambda range: the start turns of the rare low-i paths must not be cut off
+    lo, hi = sample[:, 0].min(), sample[:, 0].max()
+    lam_edges = np.arange(np.floor(lo / lambda_bin) * lambda_bin, hi + lambda_bin, lambda_bin)
+    cv_edges = []
+    for col in range(1, sample.shape[1]):
+        v = sample[:, col]
+        a, b = np.quantile(v, [0.005, 0.995])
+        if np.allclose(v, np.round(v)):  # integer CV (n_water): one bin per value
+            cv_edges.append(np.arange(np.round(a) - 0.5, np.round(b) + 1.5))
+        else:
+            cv_edges.append(np.linspace(a, b, ncvb + 1))
+    return lam_edges, cv_edges
+
+
+def lambda_profiles(feat, orders, lam_edges, cv_edges, n_groups, until_cross=False):
+    """Accumulate per-lambda-bin CV statistics per group and outcome.
+
+    Every path is first averaged within each lambda bin it visits, so a path counts
+    once per bin with its weight W regardless of how long it dwells there. The 2D
+    histograms H[cv][g, lambda_bin, cv_bin] distribute that weight W over the CV
+    values the path has in the bin.
+    """
+    nl, ncv = len(lam_edges) - 1, len(cv_edges)
+    shape = (n_groups, 2, ncv, nl)
+    S, S2 = np.zeros(shape), np.zeros(shape)
+    Wb, W2b, Nb = (np.zeros((n_groups, 2, nl)) for _ in range(3))
+    H = [np.zeros((n_groups, nl, len(e) - 1)) for e in cv_edges]
+    for pnr, W, g, o, c in feat[["pnr", "W", "group", "success", "cross_frame"]].values:
+        order = orders[int(pnr)]
+        if until_cross:
+            order = order[:int(c) + 1]
+        lb = np.digitize(order[:, 0], lam_edges) - 1
+        ok = (lb >= 0) & (lb < nl)
+        lb = lb[ok]
+        cnt = np.bincount(lb, minlength=nl)
+        vis = cnt > 0
+        g, o = int(g), int(o)
+        for col in range(ncv):
+            v = order[ok, col + 1].astype(float)
+            mean_p = np.bincount(lb, weights=v, minlength=nl)[vis] / cnt[vis]
+            S[g, o, col, vis] += W * mean_p
+            S2[g, o, col, vis] += W * mean_p ** 2
+            ncb = len(cv_edges[col]) - 1
+            cb = np.clip(np.digitize(v, cv_edges[col]) - 1, 0, ncb - 1)
+            H[col][g] += np.bincount(lb * ncb + cb, weights=W / cnt[lb],
+                                     minlength=nl * ncb).reshape(nl, ncb)
+        Wb[g, o, vis] += W
+        W2b[g, o, vis] += W ** 2
+        Nb[g, o, vis] += 1
+    return {"S": S, "S2": S2, "Wb": Wb, "W2b": W2b, "Nb": Nb, "H": H,
+            "lam_edges": lam_edges, "cv_edges": cv_edges}
+
+
+def profile_stats(prof, outcome=None):
+    """Weighted mean, standard error and number of paths per (group, cv, lambda bin).
+
+    outcome=None pools successes and failures, otherwise 0 (failure) / 1 (success).
+    """
+    sl = slice(None) if outcome is None else slice(outcome, outcome + 1)
+    S, S2 = prof["S"][:, sl].sum(1), prof["S2"][:, sl].sum(1)
+    Wb, W2b = prof["Wb"][:, sl].sum(1)[:, None], prof["W2b"][:, sl].sum(1)[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean = S / Wb
+        var = np.clip(S2 / Wb - mean ** 2, 0, None)
+        se = np.sqrt(var / (Wb ** 2 / W2b))
+    return mean, se, prof["Nb"][:, sl].sum(1)
+
+
+def profiles_table(prof, labels):
+    centers = 0.5 * (prof["lam_edges"][1:] + prof["lam_edges"][:-1])
+    rows = []
+    for outcome, name in ((None, "all"), (1, "success"), (0, "failure")):
+        mean, se, nb = profile_stats(prof, outcome)
+        for g, lab in enumerate(labels):
+            for col, cv in enumerate(CV_NAMES[1:1 + mean.shape[1]]):
+                for b in np.nonzero(nb[g] > 0)[0]:
+                    rows.append({"group": lab, "outcome": name, "cv": cv, "lambda": centers[b],
+                                 "mean": mean[g, col, b], "se": se[g, col, b], "n_paths": nb[g, b]})
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
 # Plots
 # --------------------------------------------------------------------------- #
 def style_axis(ax):
@@ -357,6 +447,121 @@ def plot_explained(metrics, labels, ref, path):
     plt.close(fig)
 
 
+def mark_interfaces(ax, interfaces, k):
+    for n, lam in enumerate(interfaces):
+        strong = n in (k - 1, k)
+        ax.axvline(lam, color="#52514e" if strong else "#d6d5d0", lw=1.0 if strong else 0.6,
+                   ls="--" if strong else "-", zorder=0)
+
+
+def plot_lambda_profiles(prof, labels, interfaces, k, path, min_paths=3):
+    """One panel per CV: weighted mean CV vs lambda per group (band = +-1 SE)."""
+    mean, se, nb = profile_stats(prof)
+    centers = 0.5 * (prof["lam_edges"][1:] + prof["lam_edges"][:-1])
+    names = CV_NAMES[1:1 + mean.shape[1]]
+    ncol = 3
+    nrow = int(np.ceil(len(names) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.2 * nrow), squeeze=False)
+    for col, cv in enumerate(names):
+        ax = axes.flat[col]
+        mark_interfaces(ax, interfaces, k)
+        for g, lab in enumerate(labels):
+            ok = nb[g] >= min_paths
+            m, s = np.where(ok, mean[g, col], np.nan), np.where(ok, se[g, col], np.nan)
+            ax.fill_between(centers, m - s, m + s, color=GROUP_COLORS[g], alpha=0.18, lw=0)
+            ax.plot(centers, m, lw=2, color=GROUP_COLORS[g], label=lab)
+        ax.set_title(cv, fontsize=9, color="#0b0b0b")
+        ax.set_xlabel("$\\lambda$", fontsize=8, color="#52514e")
+        style_axis(ax)
+    for ax in axes.flat[len(names):]:
+        ax.set_visible(False)
+    handles, labs = axes.flat[0].get_legend_handles_labels()
+    fig.suptitle(f"path-averaged CV per $\\lambda$ bin (band ±1 SE, bins with ≥{min_paths} paths; "
+                 f"dashed: $\\lambda_{{{k-1}}}$, $\\lambda_{{{k}}}$)", y=0.99, fontsize=9, color="#52514e")
+    fig.legend(handles, labs, loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=len(labels),
+               frameon=False, fontsize=9)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def plot_lambda_profiles_outcome(prof, labels, interfaces, k, path, min_paths=3):
+    """Rows: CVs, columns: groups. Solid = reaches lambda_k, dashed = turns back.
+
+    The y axis is shared along each row; its range follows the plotted means (not the
+    SE bands, which blow up for the small groups).
+    """
+    stats = {o: profile_stats(prof, o) for o in (1, 0)}
+    centers = 0.5 * (prof["lam_edges"][1:] + prof["lam_edges"][:-1])
+    names = CV_NAMES[1:1 + stats[1][0].shape[1]]
+    fig, axes = plt.subplots(len(names), len(labels), figsize=(4.6 * len(labels), 2.3 * len(names)),
+                             squeeze=False, sharex=True, sharey="row")
+    for col, cv in enumerate(names):
+        row_means = []
+        for g, lab in enumerate(labels):
+            ax = axes[col, g]
+            mark_interfaces(ax, interfaces, k)
+            for o, ls, name in ((1, "-", f"reaches $\\lambda_{{{k}}}$"), (0, "--", "turns back")):
+                mean, se, nb = stats[o]
+                ok = nb[g] >= min_paths
+                m, s = np.where(ok, mean[g, col], np.nan), np.where(ok, se[g, col], np.nan)
+                ax.fill_between(centers, m - s, m + s, color=GROUP_COLORS[g], alpha=0.15, lw=0)
+                ax.plot(centers, m, ls=ls, lw=1.8, color=GROUP_COLORS[g], label=name)
+                row_means.append(m)
+            style_axis(ax)
+            if col == 0:
+                ax.set_title(lab, fontsize=10, color="#0b0b0b")
+                ax.legend(frameon=False, fontsize=7, loc="best")
+            if g == 0:
+                ax.set_ylabel(cv, fontsize=9)
+            if col == len(names) - 1:
+                ax.set_xlabel("$\\lambda$", fontsize=8, color="#52514e")
+        lo, hi = np.nanmin(row_means), np.nanmax(row_means)
+        pad = 0.08 * (hi - lo) if hi > lo else 1.0
+        axes[col, 0].set_ylim(lo - pad, hi + pad)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def plot_lambda_hist2d(prof, labels, interfaces, k, path, min_paths=3):
+    """Rows: CVs, columns: groups. Colour: P(CV | lambda) (each lambda column normalised);
+    line: weighted mean."""
+    mean, _, nb = profile_stats(prof)
+    lam_edges = prof["lam_edges"]
+    centers = 0.5 * (lam_edges[1:] + lam_edges[:-1])
+    names = CV_NAMES[1:1 + len(prof["H"])]
+    fig, axes = plt.subplots(len(names), len(labels), figsize=(4.6 * len(labels), 2.3 * len(names)),
+                             squeeze=False, sharex=True)
+    for col, cv in enumerate(names):
+        edges = prof["cv_edges"][col]
+        for g, lab in enumerate(labels):
+            ax = axes[col, g]
+            h = prof["H"][col][g]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                h = h / h.sum(1, keepdims=True)
+            h[nb[g] < min_paths] = np.nan
+            mesh = ax.pcolormesh(lam_edges, edges, h.T, cmap="Blues", vmin=0,
+                                 vmax=np.nanquantile(h, 0.99) if np.isfinite(h).any() else 1,
+                                 shading="flat", rasterized=True)
+            ax.plot(centers, np.where(nb[g] >= min_paths, mean[g, col], np.nan),
+                    color="#0b0b0b", lw=1.2)
+            for n in (k - 1, k):
+                ax.axvline(interfaces[n], color="#eb6834", lw=1, ls="--")
+            ax.tick_params(colors="#52514e", labelsize=7)
+            if col == 0:
+                ax.set_title(lab, fontsize=10, color="#0b0b0b")
+            if g == 0:
+                ax.set_ylabel(cv, fontsize=9)
+            if g == len(labels) - 1:
+                fig.colorbar(mesh, ax=ax, pad=0.01).ax.tick_params(labelsize=6)
+            if col == len(names) - 1:
+                ax.set_xlabel("$\\lambda$", fontsize=8, color="#52514e")
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -369,6 +574,10 @@ def main():
     ap.add_argument("--frame-dt", type=float, default=0.2, help="time between order.txt frames (dt*subcycles)")
     ap.add_argument("--nperm", type=int, default=20000)
     ap.add_argument("--nboot", type=int, default=2000)
+    ap.add_argument("--lambda-bin", type=float, default=0.5, help="lambda bin width of the CV profiles")
+    ap.add_argument("--profile-until-cross", action="store_true",
+                    help="CV profiles only up to the lambda_{k-1} crossing instead of the full path")
+    ap.add_argument("--min-paths", type=int, default=3, help="min. paths per lambda bin to draw a profile")
     ap.add_argument("--outdir", default=None)
     args = ap.parse_args()
 
@@ -515,6 +724,16 @@ def main():
     plot_feature_grid(feat, labels, [f for f in features if not f.endswith("@cross")], ref,
                       outdir / "cv_window_history.png")
     plot_explained(metrics, labels, ref, outdir / "frac_explained.png")
+
+    # ---- 7. CVs vs lambda over the full paths ------------------------------ #
+    lam_edges, cv_edges = profile_bin_edges(feat, orders, args.lambda_bin)
+    prof = lambda_profiles(feat, orders, lam_edges, cv_edges, len(labels), args.profile_until_cross)
+    tag = "_until_cross" if args.profile_until_cross else ""
+    profiles_table(prof, labels).to_csv(outdir / f"cv_lambda_profiles{tag}.csv", index=False)
+    plot_lambda_profiles(prof, labels, interfaces, k, outdir / f"cv_vs_lambda{tag}.png", args.min_paths)
+    plot_lambda_profiles_outcome(prof, labels, interfaces, k, outdir / f"cv_vs_lambda_outcome{tag}.png",
+                                 args.min_paths)
+    plot_lambda_hist2d(prof, labels, interfaces, k, outdir / f"cv_vs_lambda_hist2d{tag}.png", args.min_paths)
     print(f"\nWrote tables and figures to {outdir.resolve()}")
 
 
